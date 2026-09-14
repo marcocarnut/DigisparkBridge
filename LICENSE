@@ -1,0 +1,12 @@
+DigisparkBridge is free software: you can redistribute it and/or modify it
+under the terms of the GNU General Public License, version 2 or version 3, at
+your choice, as published by the Free Software Foundation. The texts are in
+LICENSE-GPL-2.0.txt and LICENSE-GPL-3.0.txt.
+
+It is built on DigiCDCFast and V-USB, which are licensed the same way.
+
+This program is distributed in the hope that it will be useful, but WITHOUT
+ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS
+FOR A PARTICULAR PURPOSE. See the GNU General Public License for more details.
+
+Copyright (C) 2026 Marco Carnut <kikocarnut@gmail.com>
