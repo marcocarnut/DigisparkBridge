@@ -35,15 +35,11 @@
   Latest measurements of V-USB delaying other interrupts: up to ~200 us.
 */
 
-#include <DigiCDCFast.h>
-
-// 2-byte USB packets keep V-USB's interrupts-off stretches (~73 us) shorter
-// than a bit at 9600 bps; with 8-byte packets (~110 us) the planning alone
-// still let ~1 byte in 1000 through corrupted in full duplex. Build with
-//   EXTRA_FLAGS="-DHW_CDC_BULK_OUT_SIZE=2 -DHW_CDC_BULK_IN_SIZE=2"
-#if HW_CDC_BULK_OUT_SIZE != 2 || HW_CDC_BULK_IN_SIZE != 2
-#error "build with -DHW_CDC_BULK_OUT_SIZE=2 -DHW_CDC_BULK_IN_SIZE=2 (see above)"
-#endif
+// DigiCDCFast with 2-byte USB packets: V-USB's interrupts-off stretches
+// (~73 us) then stay shorter than a bit at 9600 bps. With 8-byte packets
+// (~110 us) the planning alone still let ~1 byte in 1000 through corrupted in
+// full duplex.
+#include <DigiCDCMedium.h>
 
 #define BOOTLOADER_BAUD 134
 #define STATS_BAUD      110  // diagnostics: print and clear the counters
