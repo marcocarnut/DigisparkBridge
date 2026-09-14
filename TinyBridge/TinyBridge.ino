@@ -69,6 +69,8 @@ static uint8_t txHead;                 // written by loop()
 static volatile uint8_t txTail;        // written by the handler
 static volatile bool txActive;         // an edge is scheduled
 static bool txIdle;                    // the bit on the line is idle line after a stop bit
+static uint16_t txIdleBits;            // idle bits since the last byte
+#define LINGER_BITS 10000              // how long the handler keeps running after the last byte (~1 s at 9600 bps)
 static uint16_t txFrame;               // bit 0: the bit on the line, then the rest of the byte
 static uint16_t txEdge;                // when the next edge is due
 static uint8_t txEdgeFrac;             // and its 1/64 ticks
@@ -98,8 +100,8 @@ static bool txMoved;                   // the edge just made was moved later
 
 // Diagnostic counters
 static volatile uint8_t captureOverflows;  // updated by the handler
-static uint16_t gaps, glitches, framingErrors, rxOverflows, received;
-static uint16_t sent, forcedEdges, seen, shifted, probed;  // updated by the transmitter
+static uint16_t gaps, framingErrors, received;
+static uint16_t forcedEdges, seen, shifted, probed;  // updated by the transmitter
 
 // V-USB must never wait for this handler, so it masks its own interrupt and
 // lets others in; only the counter update runs with interrupts off.
@@ -140,6 +142,7 @@ ISR(USI_OVF_vect)
 // Timer1 ticks, counted on from the last call: call at least every 256 ticks
 // (the transmitter does, while active), with interrupts off
 static uint16_t clockNow;
+extern volatile unsigned long millis_timer_overflow_count;  // the core's
 static uint16_t ticksNow()
 {
   return clockNow += (uint8_t)(TCNT1 - (uint8_t)clockNow);
@@ -245,7 +248,6 @@ static void txSchedule()
         if (txPlan(frame)) {
           txTail = (txTail + 1) & (TX_SIZE - 1);
           txIdle = false;
-          sent++;
         } else {
           frame = 3;                // an idle bit
           txIdle = true;
@@ -253,6 +255,9 @@ static void txSchedule()
       } else if (!txIdle) {
         frame = 3;                  // a bit of idle line, so the stop bit ends before a later start
         txIdle = true;
+        txIdleBits = 0;
+      } else if (++txIdleBits < LINGER_BITS) {
+        frame = 3;                  // keep running on idle bits, watching USB activity for the next burst
       } else {
         cli();
         txActive = false;
@@ -302,8 +307,14 @@ static void txStart()
   txFrame = 2;  // "a stop bit on the line": the next edge starts a byte
   txIdle = true;
   probeBits = PROBE_BITS;
-  txEdge = ticksNow();  // txPlan() moves it to now
-  lastEnd = txEdge - STALE_TICKS - 1;  // the clock may have missed overflows: forget what was seen
+  // The clock may have missed Timer1 overflows while idle: set it from the
+  // core's count of them, so what was seen of USB activity stays usable.
+  // (In loop() that count is up to date but for a pending overflow.)
+  uint8_t t = TCNT1;
+  clockNow = ((uint16_t)(uint8_t)millis_timer_overflow_count << 8) | t;
+  if ((TIFR & _BV(TOV1)) && t < 128)
+    clockNow += 256;
+  txEdge = clockNow;  // txPlan() moves it to now
   txEdgeFrac = 0;
   TIFR = _BV(OCF1A);
   sei();
@@ -360,7 +371,6 @@ static void decode(uint8_t s)
     }
   } else if (++framePos == 1 && s) {
     framePos = -1;           // start bit not low in its middle: a glitch
-    glitches++;
   } else if (framePos == nextSample) {
     if (bitsRead < 8) {
       rxByte = (rxByte >> 1) | (s ? 0x80 : 0);
@@ -370,11 +380,10 @@ static void decode(uint8_t s)
       if (s) {               // stop bit high: keep the byte
         uint8_t next = (rxHead + 1) & (RX_SIZE - 1);
         received++;
-        if (next != rxTail) {
+        if (next != rxTail) {  // (loop() forwards faster than bytes arrive)
           rxBuf[rxHead] = rxByte;
           rxHead = next;
-        } else
-          rxOverflows++;
+        }
       } else
         framingErrors++;
       framePos = -1;
@@ -411,10 +420,7 @@ static void printStats()
   writeHex('n', received);
   writeHex('g', gaps);
   writeHex('o', o);
-  writeHex('l', glitches);
   writeHex('f', framingErrors);
-  writeHex('r', rxOverflows);
-  writeHex('t', sent);
   writeHex('e', forcedEdges);
   writeHex('a', seen);
   writeHex('h', shifted);
@@ -427,8 +433,8 @@ static void printStats()
   captureOverflows = 0;
   framePos = -1;
   lastSample = false;
-  received = gaps = glitches = framingErrors = rxOverflows = 0;
-  sent = forcedEdges = seen = shifted = probed = 0;
+  received = gaps = framingErrors = 0;
+  forcedEdges = seen = shifted = probed = 0;
   sei();
 }
 
