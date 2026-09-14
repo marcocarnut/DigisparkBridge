@@ -455,10 +455,16 @@ void loop()
       decode(samples & mask);
   }
 
-  for (int room = SerialUSB.availableForWrite(); room > 0 && rxTail != rxHead; room--) {
-    SerialUSB.write(rxBuf[rxTail]);
-    rxTail = (rxTail + 1) & (RX_SIZE - 1);
-  }
+  // Received bytes go to the host 8 at a time, or once 4 ms old: each packet
+  // keeps V-USB busy, which the transmitter has to plan around
+  static unsigned long rxSince;
+  if (rxTail == rxHead)
+    rxSince = millis();
+  else if (((rxHead - rxTail) & (RX_SIZE - 1)) >= 8 || millis() - rxSince >= 4)
+    for (int room = SerialUSB.availableForWrite(); room > 0 && rxTail != rxHead; room--) {
+      SerialUSB.write(rxBuf[rxTail]);
+      rxTail = (rxTail + 1) & (RX_SIZE - 1);
+    }
 
   while (SerialUSB.available()) {
     uint8_t next = (txHead + 1) & (TX_SIZE - 1);
