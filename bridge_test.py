@@ -56,7 +56,7 @@ def stats(fd, baud, stats_baud=110):
             out += os.read(fd, 4096)
     set_speed(fd, baud)
     time.sleep(0.1)
-    m = re.search(rb"S( [a-z0-9][0-9a-f]{4})+", out)
+    m = re.search(rb"S?( [a-z0-9][0-9a-f]{4})+", out)
     if not m:
         return "no stats"
     return " ".join(f"{f[0]}={int(f[1:], 16)}" for f in m.group(0)[2:].decode().split())

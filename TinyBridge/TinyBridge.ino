@@ -20,8 +20,14 @@
   tick, 256 ticks per overflow). Each bit edge is a compare match on OC1A,
   set or clear, so the hardware makes it on time. Its handler schedules the
   next edge, and has until that edge to do it: one bit (104 us at 9600 bps).
-  An edge it misses is made as soon as the handler runs; a little late is
-  harmless, as the receiver samples near the middle of each bit.
+  An edge it misses is made 2 ticks after the handler runs.
+
+  That deadline is shorter than V-USB's busy stretches while the host
+  streams (one per millisecond, ~120 us). So each byte is planned: the
+  handler's late runs show when those stretches start, and a byte is started
+  later (or after an idle bit) when a stretch would begin within the few
+  ticks around an edge whose next edge changes the level. Bytes then go out
+  in bursts between the host's transactions.
 
   Latest measurements of V-USB delaying other interrupts: up to ~200 us.
 */
@@ -32,8 +38,8 @@
 #define STATS_BAUD      110  // diagnostics: print and clear the counters
 #define SAMPLES_PER_BIT 3
 #define CAPTURE_SIZE    16  // powers of 2
-#define RX_SIZE         32
-#define TX_SIZE         32
+#define RX_SIZE         16
+#define TX_SIZE         16
 #define GAP             1   // capture flag: samples were lost before these
 
 // Sample bytes from USI (oldest sample in bit 7) and their flags
@@ -45,27 +51,44 @@ static uint8_t rxBuf[RX_SIZE];
 static uint8_t rxHead, rxTail;
 static uint8_t prescaler;  // TCCR0B clock select
 
-// Transmitter: the line and the next edge
+// Transmitter: the line and the next edge. Times are in Timer1 ticks (64 CPU
+// cycles), modulo 2^16.
 static uint8_t txBuf[TX_SIZE];
 static uint8_t txHead;                 // written by loop()
 static volatile uint8_t txTail;        // written by the handler
 static volatile bool txActive;         // an edge is scheduled
 static bool txIdle;                    // the bit on the line is idle line after a stop bit
 static uint16_t txFrame;               // bit 0: the bit on the line, then the rest of the byte
-static uint16_t txEdge;                // CPU cycles, modulo 64 * 256; OCR1A = txEdge >> 6
+static uint16_t txEdge;                // when the next edge is due
+static uint8_t txEdgeFrac;             // and its 1/64 ticks
 static uint16_t bitCycles;
-static uint8_t bitTicks;               // bitCycles in Timer1 ticks, rounded up
-static uint8_t lateTicks;              // edges later than this (1/4 bit) count as late
+static uint8_t bitTicks, bitFrac;      // bitCycles in ticks and 1/64 ticks
+static uint8_t edgeTicks[10];          // edge k of a byte, ticks after its start edge
+
+// USB activity: the host's transactions come every millisecond, and V-USB
+// keeps interrupts off while it handles them (measured: one stretch per
+// millisecond, starting at the same point, lasting up to ~30 ticks)
+#define WINDOW_TICKS 40                // longest activity to plan around (130 us)
+#define SEEN_TICKS   8                 // a handler this late (31 us) was held by activity
+#define HANDLER_TICKS 10                // a handler's own run time
+#define STALE_TICKS  4096              // after 16 ms without seeing activity, look again
+#define PROBE_BITS   11                // idle bits spent looking, before a byte
+static uint16_t activityStart;         // when the latest activity started (estimated)
+static uint16_t lastEnd;               // when the latest activity seen ended
+static uint16_t framePeriod = 16500 / 4;  // USB frame period, 1/16 ticks
+static uint8_t probeBits;
+static uint8_t bandBefore;             // activity starting this soon before an edge holds its handler too long
+static bool txMoved;                   // the edge just made was moved later
 
 #define COM1A_MASK (_BV(COM1A1) | _BV(COM1A0))
 #define COM1A_SET  (_BV(COM1A1) | _BV(COM1A0))
 #define COM1A_CLR  _BV(COM1A1)
 
+
 // Diagnostic counters
 static volatile uint8_t captureOverflows;  // updated by the handler
 static uint16_t gaps, glitches, framingErrors, rxOverflows, received;
-static uint16_t sent, forcedEdges, lateEdges;  // updated by the transmitter
-static uint16_t entryLate[8];  // handler entries by ticks after the match, in steps of 7 (27 µs)
+static uint16_t sent, forcedEdges, seen, shifted, probed;  // updated by the transmitter
 
 // V-USB must never wait for this handler, so it masks its own interrupt and
 // lets others in; only the counter update runs with interrupts off.
@@ -103,18 +126,112 @@ ISR(USI_OVF_vect)
   USICR = _BV(USICS0) | _BV(USIOIE);
 }
 
+// Timer1 ticks, counted on from the last call: call at least every 256 ticks
+// (the transmitter does, while active), with interrupts off
+static uint16_t clockNow;
+static uint16_t ticksNow()
+{
+  return clockNow += (uint8_t)(TCNT1 - (uint8_t)clockNow);
+}
+
+static void txAdvance()  // txEdge one bit later
+{
+  txEdgeFrac += bitFrac;
+  txEdge += bitTicks + (txEdgeFrac >> 6);
+  txEdgeFrac &= 63;
+}
+
+// USB activity ended at `end`, having held the handler of an edge made `late`
+// ticks earlier
+static void activitySeen(uint16_t end, uint8_t late)
+{
+  uint16_t d = (end - lastEnd) << 4;
+  if (d >= 16500 / 4 - 40 && d <= 16500 / 4 + 40)  // a frame after the last (within 1%)
+    framePeriod += (int16_t)(d - framePeriod) >> 4;
+  lastEnd = end;
+  // It started by the edge, and after the previous edge's handler had run
+  uint16_t hi = end - late, lo = hi - bitTicks + HANDLER_TICKS;
+  uint16_t start = activityStart, period = framePeriod >> 4;
+  if ((uint16_t)(hi - start) > STALE_TICKS)
+    start = hi;
+  while ((int16_t)(hi - start) > (int16_t)(period >> 1))  // the predicted start nearest to it
+    start += period;
+  if ((int16_t)(start - hi) > 0)
+    start = hi;
+  else if ((int16_t)(lo - start) > 0)
+    start = lo;
+  activityStart = start;
+  seen++;
+}
+
+// How much later a byte (frame, start bit first) must start, in ticks, so
+// that USB activity starting `d` ticks after its start edge can't hold the
+// handler of an edge past the next one where the level changes. 0 when it can't.
+static uint8_t shiftNeeded(uint16_t frame, int16_t d)
+{
+  for (uint8_t k = 0; k < 9; k++, frame >>= 1) {
+    int16_t from = edgeTicks[k] - bandBefore;
+    if (((frame ^ (frame >> 1)) & 1) && d > from && d <= edgeTicks[k] + HANDLER_TICKS)
+      return d - from;
+  }
+  return 0;
+}
+
+// Choose when the byte in `frame` starts, at txEdge or later. Returns false
+// to send an idle bit first instead (looking for USB activity).
+static bool txPlan(uint16_t frame)
+{
+  cli();
+  uint16_t now = ticksNow();
+  sei();
+  if ((int16_t)(txEdge - now) < 2) {  // the handler ran late: start from now
+    txEdge = now + 2;
+    txEdgeFrac = 0;
+  }
+  if (bitTicks >= WINDOW_TICKS)  // bits long enough to ride out any activity
+    return true;
+  if ((uint16_t)(now - lastEnd) > STALE_TICKS) {
+    if (probeBits) {
+      probeBits--;
+      probed++;
+      return false;
+    }
+    return true;  // none seen: whatever there is, is short
+  }
+  // The first activity predicted to start after (or just before) the start edge
+  uint16_t start = activityStart, period = framePeriod >> 4;
+  while ((int16_t)(start - txEdge) <= -(int16_t)bandBefore)
+    start += period;
+  // Start later until safe. Beyond 128 ticks (OCR1A's reach), send an idle bit and plan again.
+  uint8_t total = 0;
+  for (uint8_t shift; (shift = shiftNeeded(frame, start - txEdge - total)); total += shift)
+    if (total + shift > 128)
+      return false;
+  if (total) {
+    txEdge += total;
+    shifted++;
+  }
+  return true;
+}
+
 // Schedule the next edge after the one on the line. Runs with Timer1's
 // compare interrupt masked and interrupts on; returns with interrupts off.
 static void txSchedule()
 {
   for (;;) {
     uint16_t frame = txFrame >> 1;  // bit 0: the bit that starts at the next edge
+    txAdvance();
     if (frame == 1) {               // the next edge ends a stop bit
       if (txTail != txHead) {
         frame = 0x600 | (txBuf[txTail] << 1);  // start bit, 8 data bits, stop bit, end marker
-        txTail = (txTail + 1) & (TX_SIZE - 1);
-        txIdle = false;
-        sent++;
+        if (txPlan(frame)) {
+          txTail = (txTail + 1) & (TX_SIZE - 1);
+          txIdle = false;
+          sent++;
+        } else {
+          frame = 3;                // an idle bit
+          txIdle = true;
+        }
       } else if (!txIdle) {
         frame = 3;                  // a bit of idle line, so the stop bit ends before a later start
         txIdle = true;
@@ -125,40 +242,39 @@ static void txSchedule()
       }
     }
     txFrame = frame;
-    txEdge += bitCycles;
-    uint8_t edge = txEdge >> 6;
 
     cli();
     TCCR1 = (TCCR1 & ~COM1A_MASK) | (frame & 1 ? COM1A_SET : COM1A_CLR);
-    OCR1A = edge;
-    uint8_t ahead = edge - TCNT1;
-    if (ahead >= 2 && ahead <= bitTicks) {  // the hardware will make the edge
-      TIFR = _BV(OCF1A);  // a match from an edge made below would call the handler early
-      TIMSK |= _BV(OCIE1A);
-      return;
+    OCR1A = txEdge;
+    uint16_t now = ticksNow();
+    if ((int16_t)(txEdge - now) < 2) {  // too late for a match at its time
+      if (frame >= 0x400) {             // a start bit: start the byte later instead
+        txEdge = now + 2;
+        txEdgeFrac = 0;
+      } else {
+        forcedEdges++;
+        txMoved = true;
+      }
+      // Make the edge 2 ticks from now. (Forcing a match with FOC1A right
+      // after changing COM1A made no edge: the output kept its level.)
+      OCR1A = now + 2;
     }
-    sei();
-
-    if (ahead < 2) {  // due within 2 ticks: wait until it's past
-      while ((uint8_t)(edge - TCNT1) < 2)
-        ;
-    } else {
-      forcedEdges++;  // the handler ran too late for the hardware
-      if ((uint8_t)(TCNT1 - edge) > lateTicks)
-        lateEdges++;
-    }
-    // Make the edge now in case no match did (set and clear are idempotent)
-    GTCCR |= _BV(FOC1A);
+    TIFR = _BV(OCF1A);  // an old match would call the handler early
+    TIMSK |= _BV(OCIE1A);
+    return;
   }
 }
 
 ISR(TIMER1_COMPA_vect)  // an edge was made
 {
   TIMSK &= ~_BV(OCIE1A);  // V-USB must never wait for this handler
-  uint8_t late = TCNT1 - OCR1A;
+  uint16_t now = ticksNow();
   sei();
-  late /= 7;
-  entryLate[late < 7 ? late : 7]++;
+  int16_t late = now - txEdge;
+  if (!txMoved && late >= SEEN_TICKS && late < 128) {
+    activitySeen(now, late);
+  }
+  txMoved = false;
   txSchedule();
 }
 
@@ -167,8 +283,12 @@ static void txStart()
   txActive = true;
   txFrame = 2;  // "a stop bit on the line": the next edge starts a byte
   txIdle = true;
-  txEdge = ((TCNT1 + 3) << 6) - bitCycles;  // 3 ticks from now
+  probeBits = PROBE_BITS;
+  txEdge = ticksNow();  // txPlan() moves it to now
+  lastEnd = txEdge - STALE_TICKS - 1;  // the clock may have missed overflows: forget what was seen
+  txEdgeFrac = 0;
   TIFR = _BV(OCF1A);
+  sei();
   txSchedule();
   sei();
 }
@@ -189,8 +309,11 @@ static void uartBegin(unsigned long baud)
   TCCR1 = (TCCR1 & ~COM1A_MASK) | COM1A_SET;
   GTCCR |= _BV(FOC1A);    // idle line
   bitCycles = (F_CPU + baud / 2) / baud;
-  bitTicks = (bitCycles >> 6) + 1;
-  lateTicks = bitCycles >> 8;
+  bitTicks = bitCycles >> 6;
+  bitFrac = bitCycles & 63;
+  for (uint8_t k = 0; k < 10; k++)
+    edgeTicks[k] = (k * (unsigned long)bitCycles) >> 6;
+  bandBefore = WINDOW_TICKS + HANDLER_TICKS > bitTicks ? WINDOW_TICKS + HANDLER_TICKS - bitTicks : 0;
   USICR = 0;
   TCCR0B = 0;
   TCCR0A = _BV(WGM01);  // CTC: period is OCR0A + 1
@@ -275,9 +398,9 @@ static void printStats()
   writeHex('r', rxOverflows);
   writeHex('t', sent);
   writeHex('e', forcedEdges);
-  writeHex('x', lateEdges);
-  for (uint8_t i = 0; i < 8; i++)
-    writeHex('0' + i, entryLate[i]);
+  writeHex('a', seen);
+  writeHex('h', shifted);
+  writeHex('p', probed);
   SerialUSB.write('\r');
   SerialUSB.write('\n');
   // Printing kept loop() busy: drop the samples it couldn't decode meanwhile
@@ -287,9 +410,7 @@ static void printStats()
   framePos = -1;
   lastSample = false;
   received = gaps = glitches = framingErrors = rxOverflows = 0;
-  sent = forcedEdges = lateEdges = 0;
-  for (uint8_t i = 0; i < 8; i++)
-    entryLate[i] = 0;
+  sent = forcedEdges = seen = shifted = probed = 0;
   sei();
 }
 
