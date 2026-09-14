@@ -2,10 +2,12 @@
 """Test a USB-UART bridge against a reference USB-serial adapter wired to
 its UART (TX to RX, RX to TX, GND to GND).
 
-usage: bridge_test.py [--bridge PORT] [--adapter PORT] [--bytes N] BAUD...
+usage: bridge_test.py [--bridge PORT] [--adapter PORT] [--bytes N] [--rx-only] BAUD...
 
 For each bit rate: adapter -> bridge, bridge -> adapter, then both at once,
-each with N pseudo-random bytes (default 100000). Reports throughput and
+each with N pseudo-random bytes (default 100000). With --rx-only (for a
+receive-only bridge): adapter -> bridge with the host idle, then again while
+the host floods the bridge's USB port with data the bridge discards. Reports throughput and
 bytes lost, extra or corrupted, found by realigning the received data with
 what was sent.
 """
@@ -110,6 +112,7 @@ def main():
     ap.add_argument("--bridge", default="/dev/ttyACM0")
     ap.add_argument("--adapter", default="/dev/ttyUSB0")
     ap.add_argument("--bytes", type=int, default=100000)
+    ap.add_argument("--rx-only", action="store_true")
     ap.add_argument("bauds", type=int, nargs="+")
     args = ap.parse_args()
     results = []
@@ -126,6 +129,12 @@ def main():
         (got,), secs = transfer([(adapter, bridge, a)])
         results.append(report("adapter -> bridge", a, got, secs))
         drain(bridge)
+        if args.rx_only:
+            (got, _), secs = transfer([(adapter, bridge, a), (bridge, adapter, b)])
+            results.append(report("... host flooding", a, got, secs))
+            os.close(bridge)
+            os.close(adapter)
+            continue
         (got,), secs = transfer([(bridge, adapter, b)])
         results.append(report("bridge -> adapter", b, got, secs))
         drain(adapter)
