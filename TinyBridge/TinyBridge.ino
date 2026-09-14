@@ -6,7 +6,7 @@
   Wiring: UART RX to PB0 (USI DI), UART TX from PB1 (OC1A; the LED on PB1
   doesn't matter), GND.
   Bit rate: the rate the host sets for the USB port (stty), 8N1, 1200 to
-  19200 bps. 134 bps jumps to the micronucleus bootloader; 110 bps prints the
+  9600 bps (receiving alone also 19200). 134 bps jumps to the micronucleus bootloader; 110 bps prints the
   diagnostic counters as hex and clears them, leaving the UART as it was.
 
   Receiving: Timer0 clocks USI three times per bit, so every sample is taken
@@ -22,17 +22,28 @@
   next edge, and has until that edge to do it: one bit (104 us at 9600 bps).
   An edge it misses is made 2 ticks after the handler runs.
 
-  That deadline is shorter than V-USB's busy stretches while the host
-  streams (one per millisecond, ~120 us). So each byte is planned: the
-  handler's late runs show when those stretches start, and a byte is started
-  later (or after an idle bit) when a stretch would begin within the few
-  ticks around an edge whose next edge changes the level. Bytes then go out
-  in bursts between the host's transactions.
+  V-USB keeps interrupts off for each USB transaction, and while data flows
+  the host makes one or two every millisecond, each starting at the same
+  point of the frame. With DigiCDCFast's usual 8-byte packets each takes
+  ~110 us, longer than the deadline; built for 2-byte packets (below), ~73 us.
+  A transaction starting just before an edge, or while its handler runs, can
+  still hold the handler past the next edge. So each byte is planned: the
+  handler's late runs show when the transactions start, and a byte starts
+  later (or after an idle bit) when one would begin near an edge whose next
+  edge changes the level. Bytes go out between the host's transactions.
 
   Latest measurements of V-USB delaying other interrupts: up to ~200 us.
 */
 
 #include <DigiCDCFast.h>
+
+// 2-byte USB packets keep V-USB's interrupts-off stretches (~73 us) shorter
+// than a bit at 9600 bps; with 8-byte packets (~110 us) the planning alone
+// still let ~1 byte in 1000 through corrupted in full duplex. Build with
+//   EXTRA_FLAGS="-DHW_CDC_BULK_OUT_SIZE=2 -DHW_CDC_BULK_IN_SIZE=2"
+#if HW_CDC_BULK_OUT_SIZE != 2 || HW_CDC_BULK_IN_SIZE != 2
+#error "build with -DHW_CDC_BULK_OUT_SIZE=2 -DHW_CDC_BULK_IN_SIZE=2 (see above)"
+#endif
 
 #define BOOTLOADER_BAUD 134
 #define STATS_BAUD      110  // diagnostics: print and clear the counters
@@ -66,9 +77,9 @@ static uint8_t bitTicks, bitFrac;      // bitCycles in ticks and 1/64 ticks
 static uint8_t edgeTicks[10];          // edge k of a byte, ticks after its start edge
 
 // USB activity: the host's transactions come every millisecond, and V-USB
-// keeps interrupts off while it handles them (measured: one stretch per
-// millisecond, starting at the same point, lasting up to ~30 ticks)
-#define WINDOW_TICKS 40                // longest activity to plan around (130 us)
+// keeps interrupts off while it handles them (measured: one or two stretches
+// per millisecond, each starting at the same point)
+#define WINDOW_TICKS 52                // activity to plan around, found best by testing (200 us)
 #define SEEN_TICKS   8                 // a handler this late (31 us) was held by activity
 #define HANDLER_TICKS 10                // a handler's own run time
 #define STALE_TICKS  4096              // after 16 ms without seeing activity, look again
@@ -202,11 +213,18 @@ static bool txPlan(uint16_t frame)
   uint16_t start = activityStart, period = framePeriod >> 4;
   while ((int16_t)(start - txEdge) <= -(int16_t)bandBefore)
     start += period;
-  // Start later until safe. Beyond 128 ticks (OCR1A's reach), send an idle bit and plan again.
+  // Start later until safe. Beyond 128 ticks (OCR1A's reach), send an idle
+  // bit and plan again; a byte that fits nowhere goes after 10 idle bits.
+  static uint8_t idle;
   uint8_t total = 0;
   for (uint8_t shift; (shift = shiftNeeded(frame, start - txEdge - total)); total += shift)
-    if (total + shift > 128)
-      return false;
+    if (total + shift > 128) {
+      if (++idle < 10)
+        return false;
+      total = 0;
+      break;
+    }
+  idle = 0;
   if (total) {
     txEdge += total;
     shifted++;
