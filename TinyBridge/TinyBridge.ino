@@ -40,6 +40,7 @@
 // (~110 us) the planning alone still let ~1 byte in 1000 through corrupted in
 // full duplex.
 #include <DigiCDCMedium.h>
+#include <util/crc16.h>
 
 #define STATS           1    // 1: 110 bps prints and clears diagnostic counters
 #define BOOTLOADER_BAUD 134
@@ -117,13 +118,25 @@ static struct {
   uint16_t received, gaps, framingErrors;
   uint16_t forcedEdges, seen, shifted, probed;  // updated by the transmitter
   uint8_t captureOverflows;                     // updated by the receive handler
+  uint16_t usbCrc, usbBytes;                    // CRC-XMODEM and count of the bytes read from USB
 } stats;
 #else
 #define COUNT(counter) ((void)0)
 #endif
 
-// Collect USI's samples. Runs with USI's interrupt masked, interrupts on;
-// returns with interrupts off.
+// Timer1 ticks, counted on from the last call: call at least every 256 ticks
+// (the transmitter does, while active), with interrupts off
+static uint16_t clockNow;
+extern volatile unsigned long millis_timer_overflow_count;  // the core's
+static uint16_t ticksNow()
+{
+  return clockNow += (uint8_t)(TCNT1 - (uint8_t)clockNow);
+}
+
+// Collect USI's samples. Runs with USI's interrupt masked, interrupts on,
+// and unmasks it: the handler restores its registers with interrupts on (V-USB
+// must not wait; USI's next overflow is at least a sample away, so it nests
+// only when this ran far too late anyway).
 extern "C" void rxCapture() __attribute__((used));
 void rxCapture()
 {
@@ -155,16 +168,19 @@ void rxCapture()
   else
     COUNT(captureOverflows);
 
-  cli();
   USICR = _BV(USICS0) | _BV(USIOIE);
 }
 
-// Entry stub for the transmit handler. V-USB must never wait for it, and the
+// Entry stub for the transmit handler. V-USB must never wait for it (it has
+// to start within a few dozen cycles of a packet, or may misread it), and the
 // stack is small: it masks its own interrupt and millis()' (whose
 // non-blocking handler would otherwise nest in it, deepening the stack), lets
 // other interrupts in, and only then saves the registers a C function may
-// change. On the way out it puts millis()' interrupt back as it found it. (A
-// plain ISR saved 27 registers with interrupts off.)
+// change. It restores them with interrupts still on, then in one short
+// interrupts-off step unmasks its interrupt if asked (r24 from the handler)
+// and puts millis()' back as it found it. (A plain ISR saved 27 registers with
+// interrupts off; restoring them with interrupts off, with the handler's own,
+// took over 100 cycles and let USB packets from the host arrive corrupted.)
 #define STUB_SAVE \
     "sei\n" \
     "push r0\n push r1\n clr r1\n" \
@@ -174,7 +190,7 @@ void rxCapture()
     "pop r31\n pop r30\n pop r27\n pop r26\n pop r25\n" \
     "pop r23\n pop r22\n pop r21\n pop r20\n pop r19\n pop r18\n" \
     "pop r1\n pop r0\n" \
-    "pop r24\n bst r24, 2\n in r24, 0x39\n bld r24, 2\n out 0x39, r24\n"  /* TOIE1 as it was */ \
+    "cli\n bst r24, 6\n pop r24\n bld r24, 6\n out 0x39, r24\n"  /* TIMSK as found, OCIE1A as asked */ \
     "pop r24\n out 0x3f, r24\n pop r24\n reti\n"
 
 // A plain handler: an entry stub let the transmit handler nest before the
@@ -184,15 +200,6 @@ ISR(USI_OVF_vect)
   USICR = _BV(USICS0);  // mask USI's interrupt, keep clocking it from Timer0
   sei();
   rxCapture();
-}
-
-// Timer1 ticks, counted on from the last call: call at least every 256 ticks
-// (the transmitter does, while active), with interrupts off
-static uint16_t clockNow;
-extern volatile unsigned long millis_timer_overflow_count;  // the core's
-static uint16_t ticksNow()
-{
-  return clockNow += (uint8_t)(TCNT1 - (uint8_t)clockNow);
 }
 
 static void txAdvance()  // txEdge one bit later
@@ -283,10 +290,10 @@ static bool txPlan(uint16_t frame)
 }
 
 // Schedule the next edge after the one on the line. Runs with Timer1's
-// compare (and millis()') interrupts masked, interrupts on; returns with
-// interrupts off. edgeMade: called from the compare interrupt.
-extern "C" void txSchedule(uint8_t edgeMade) __attribute__((used));
-void txSchedule(uint8_t edgeMade)
+// compare (and millis()') interrupts masked, interrupts on. Returns the TIMSK
+// bit to unmask (OCIE1A, or 0 when done). edgeMade: called from the compare
+// interrupt.
+extern "C" __attribute__((used)) uint8_t txSchedule(uint8_t edgeMade)
 {
   if (edgeMade) {
     cli();
@@ -317,16 +324,18 @@ void txSchedule(uint8_t edgeMade)
       } else if (++txIdleBits < LINGER_BITS) {
         frame = 3;                  // keep running on idle bits, watching USB activity for the next burst
       } else {
-        cli();
         txActive = false;
-        return;
+        return 0;
       }
     }
     txFrame = frame;
 
-    cli();
+    // With interrupts on: OCR1A still holds a time well past (the edge just
+    // made, or txStart()'s), so no match comes between these; the check
+    // below catches an edge already too late
     TCCR1 = (TCCR1 & ~COM1A_MASK) | (frame & 1 ? COM1A_SET : COM1A_CLR);
     OCR1A = txEdge;
+    cli();
     uint16_t now = ticksNow();
     if ((int16_t)(txEdge - now) < 2) {  // too late for a match at its time
       if (frame >= 0x400) {             // a start bit: start the byte later instead
@@ -341,8 +350,8 @@ void txSchedule(uint8_t edgeMade)
       OCR1A = now + 2;
     }
     TIFR = _BV(OCF1A);  // an old match would call the handler early
-    TIMSK |= _BV(OCIE1A);
-    return;
+    sei();
+    return _BV(OCIE1A);
   }
 }
 
@@ -370,10 +379,13 @@ static void txStart()
   if ((TIFR & _BV(TOV1)) && t < 128)
     clockNow += 256;
   txEdge = clockNow;  // txPlan() moves it to now
+  OCR1A = t + 128;    // no match while txSchedule() changes the level
   txEdgeFrac = 0;
   TIFR = _BV(OCF1A);
   sei();
-  txSchedule(0);
+  uint8_t unmask = txSchedule(0);
+  cli();
+  TIMSK |= unmask;
   sei();
 }
 
@@ -487,6 +499,8 @@ static void printStats()
   writeHex('a', stats.seen);
   writeHex('h', stats.shifted);
   writeHex('p', stats.probed);
+  writeHex('c', stats.usbCrc);
+  writeHex('b', stats.usbBytes);
   SerialUSB.write('\r');
   SerialUSB.write('\n');
   // Printing kept loop() busy: drop the samples it couldn't decode meanwhile
@@ -564,6 +578,10 @@ void loop()
     if (next == txTail)
       break;
     txBuf[txHead] = SerialUSB.read();
+#if STATS
+    stats.usbCrc = _crc_xmodem_update(stats.usbCrc, txBuf[txHead]);
+    stats.usbBytes++;
+#endif
     txHead = next;
   }
   if (!txActive && txHead != txTail) {

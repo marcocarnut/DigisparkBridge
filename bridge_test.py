@@ -12,7 +12,7 @@ bytes lost, extra or corrupted, found by realigning the received data with
 what was sent. With --stats, also prints the bridge's diagnostic counters
 after each transfer (a sketch that prints them when set to 110 bps).
 """
-import argparse
+import argparse, binascii
 import os
 import re
 import random
@@ -45,9 +45,17 @@ def set_speed(fd, baud):
     termios.tcsetattr(fd, termios.TCSANOW, attrs)
 
 
+STATS_WAIT = 0.1
+
+
+def host_crc(data):
+    """What TinyBridge's c counter should read after taking `data` from USB."""
+    return f"        host c={binascii.crc_hqx(data, 0)} b={len(data)}"
+
+
 def stats(fd, baud, stats_baud=110):
     """Switch the bridge to the stats rate, collect its counter line, switch back."""
-    drain(fd, 0.1)
+    drain(fd, STATS_WAIT)
     set_speed(fd, stats_baud)
     out = b""
     end = time.time() + 1.5
@@ -56,7 +64,7 @@ def stats(fd, baud, stats_baud=110):
             out += os.read(fd, 4096)
     set_speed(fd, baud)
     time.sleep(0.1)
-    m = re.search(rb"S?( [a-z0-9][0-9a-f]{4})+", out)
+    m = re.search(rb"S?( [a-zA-Z0-9][0-9a-f]{4})+", out)
     if not m:
         return "no stats"
     return " ".join(f"{f[0]}={int(f[1:], 16)}" for f in m.group(0)[2:].decode().split())
@@ -143,8 +151,14 @@ def main():
     ap.add_argument("--bytes", type=int, default=100000)
     ap.add_argument("--rx-only", action="store_true")
     ap.add_argument("--stats", action="store_true")
+    ap.add_argument("--stats-wait", type=float, default=0.1,
+                    help="quiet seconds before asking for the counters")
+    ap.add_argument("--duplex-only", action="store_true",
+                    help="only the test with data both ways")
     ap.add_argument("bauds", type=int, nargs="+")
     args = ap.parse_args()
+    global STATS_WAIT
+    STATS_WAIT = args.stats_wait
     results = []
     for baud in args.bauds:
         print(f"== {baud} bps", flush=True)
@@ -158,6 +172,17 @@ def main():
         rnd = random.Random(baud)
         a = rnd.randbytes(args.bytes)
         b = rnd.randbytes(args.bytes)
+        if args.duplex_only:
+            (got_a, got_b), secs = transfer([(adapter, bridge, a), (bridge, adapter, b)])
+            results.append(report("both: to bridge", a, got_a, secs))
+            results.append(report("both: to adapter", b, got_b, secs))
+            if args.stats:
+                drain(bridge)
+                print(host_crc(b))
+                print("        " + stats(bridge, baud), flush=True)
+            os.close(bridge)
+            os.close(adapter)
+            continue
         (got,), secs = transfer([(adapter, bridge, a)])
         results.append(report("adapter -> bridge", a, got, secs))
         drain(bridge)
@@ -176,12 +201,14 @@ def main():
         results.append(report("bridge -> adapter", b, got, secs))
         drain(adapter)
         if args.stats:
+            print(host_crc(b))
             print("        " + stats(bridge, baud), flush=True)
         (got_a, got_b), secs = transfer([(adapter, bridge, a), (bridge, adapter, b)])
         results.append(report("both: to bridge", a, got_a, secs))
         results.append(report("both: to adapter", b, got_b, secs))
         if args.stats:
             drain(bridge)
+            print(host_crc(b))
             print("        " + stats(bridge, baud), flush=True)
         os.close(bridge)
         os.close(adapter)
