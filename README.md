@@ -12,7 +12,9 @@ bitbanged USB in software on the same 8-bit chip.
 19200 bps in every test, even while the bridge also transmits. Transmitting
 at 9600 bps is clean one way at a time, but under heavy traffic in both
 directions about 1 byte in 20000 still goes out corrupted (details below).
-So it suits receive-mostly devices, such as a GPS module at 9600 bps,
+How often depends on the host: on one PC, behind a USB 2 hub, heavy
+two-way traffic went through practically error-free (see
+[Hubs and hosts](#hubs-and-hosts)). So it suits receive-mostly devices, such as a GPS module at 9600 bps,
 request-response protocols and half-duplex links, or anything that
 retransmits on errors. For a serial port you can rely on in every case, a
 USB-serial chip costs less than a dollar, and the
@@ -155,6 +157,31 @@ at 9600 bps in both directions corrupted 12 bytes in 120 kB with the first
 release and 18 with the current one, and bursts 3 and 7 in 72 kB, which is
 within chance.
 
+### Hubs and hosts
+
+How often transmitted bytes get corrupted in full duplex depends on where
+the host's USB controller places the bridge's transactions in each frame,
+and that changes with the host and with a hub in between. The same sketch
+and adapter at 9600 bps, both directions at once, 50 kB each, three runs per
+setup (`e` is the bridge's count of edges made late, see
+[Diagnostics](#diagnostics)):
+
+| Host | Connection | Corrupted bytes to the adapter | Edges made late |
+|------|------------|--------------------------------|-----------------|
+| PC (Intel Meteor Lake xHCI, Linux 6.8) | directly | 8, 10, 14 | ~37,400 |
+| PC (Intel Meteor Lake xHCI, Linux 6.8) | through a USB 3 hub (Genesys Logic, USB ID 05e3:0610) | 1, 0, 2 and 0, 0, 0 | ~7,000 |
+| Raspberry Pi 5 (RP1, Linux 6.12) | directly | 5, 2, 4 | ~38,800 |
+| Raspberry Pi 5 (RP1, Linux 6.12) | through the same hub | 7, 9, 9 | ~37,300 |
+
+Behind a high-speed hub, the host controller schedules a low-speed device's
+transactions through the hub's transaction translator. On the PC that left
+the transmitter's handlers five times fewer late edges and made full duplex
+practically clean (and slightly faster, 873 bytes/s); on the Raspberry Pi
+the same hub changed nothing. It isn't the Digispark's clock: its frame
+length (`P`) was the same within 0.1% in the best and worst of these
+sessions. So if full duplex matters, try the bridge with and without a hub
+on your host.
+
 Things tried along the way:
 
 - **8-byte USB packets** (plain `DigiCDCFast.h`): transmit 3-7 corrupted per
@@ -196,6 +223,9 @@ and clear them:
   `f` framing errors;
 - TinyBridge also: `k` stack bytes never used, `e` edges made late, `a` USB
   transactions seen, `h` bytes started later, `p` idle bits spent looking,
+  `z` bytes sent after 10 idle bits without a safe place, `P` the USB frame
+  length it measures, in 1/16 Timer1 ticks (4125 with an exact 16.5 MHz
+  clock; 0.1% is about 4),
   `c` and `b` the CRC-16 (XMODEM) and count of the bytes read from USB, to
   compare with what the host sent;
 - TinyBridgeUsi3x also: `l` glitches, `r` receive buffer overflows.

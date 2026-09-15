@@ -116,7 +116,7 @@ static bool txMoved;                   // the edge just made was moved later
 #define COUNT(counter) (stats.counter++)
 static struct {
   uint16_t received, gaps, framingErrors;
-  uint16_t forcedEdges, seen, shifted, probed;  // updated by the transmitter
+  uint16_t forcedEdges, seen, shifted, probed, gaveUp;  // updated by the transmitter
   uint8_t captureOverflows;                     // updated by the receive handler
   uint16_t usbCrc, usbBytes;                    // CRC-XMODEM and count of the bytes read from USB
 } stats;
@@ -278,6 +278,7 @@ static bool txPlan(uint16_t frame)
     if (total + shift > 128) {
       if (++idle < 10)
         return false;
+      COUNT(gaveUp);  // sent where it doesn't fit
       total = 0;
       break;
     }
@@ -499,6 +500,8 @@ static void printStats()
   writeHex('a', stats.seen);
   writeHex('h', stats.shifted);
   writeHex('p', stats.probed);
+  writeHex('z', stats.gaveUp);
+  writeHex('P', framePeriod);  // USB frame in 1/16 Timer1 ticks: 4125 with an exact 16.5 MHz clock
   writeHex('c', stats.usbCrc);
   writeHex('b', stats.usbBytes);
   SerialUSB.write('\r');
