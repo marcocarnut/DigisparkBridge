@@ -1,10 +1,12 @@
 # DigisparkBridge
 
-An experimental USB-to-UART bridge for the original Digispark (ATtiny85),
-which has no UART at all: it receives with the USI peripheral, oversampling
-in hardware, and transmits with bit edges timed by a timer's compare output,
-while [DigiCDCFast](https://github.com/marcocarnut/DigiCDCFast) runs USB
-in software on the same 8-bit chip.
+An experimental USB-to-UART bridge for the original Digispark (ATtiny85)
+but limited to 9,600 bps full duplex (barely, see notes below); receiving
+alone works up to 19,200 bps. Which is not too shabby for a device that has no UART
+at all: it receives with the USI peripheral, oversampling in hardware, and
+transmits with bit edges timed by a timer's compare output,
+while [DigiCDCFast](https://github.com/marcocarnut/DigiCDCFast) runs
+bitbanged USB in software on the same 8-bit chip.
 
 **Is it useful?** For some things. Receiving is solid: lossless up to
 19200 bps in every test, even while the bridge also transmits. Transmitting
