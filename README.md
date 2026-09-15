@@ -1,25 +1,26 @@
 # DigisparkBridge
 
 An experimental USB-to-UART bridge for the original Digispark (ATtiny85)
-but limited to 9,600 bps full duplex (barely, see notes below); receiving
-alone works up to 19,200 bps. Which is not too shabby for a device that has no UART
+but limited to 9,600 bps, both directions at once, by taking turns on USB
+(see notes below); receiving alone works up to 19,200 bps. Which is not too shabby for a device that has no UART
 at all: it receives with the USI peripheral, oversampling in hardware, and
 transmits with bit edges timed by a timer's compare output,
 while [DigiCDCFast](https://github.com/marcocarnut/DigiCDCFast) runs
 bitbanged USB in software on the same 8-bit chip.
 
-**Is it useful?** For some things. Receiving is solid: lossless up to
-19200 bps in every test, even while the bridge also transmits. Transmitting
-at 9600 bps is clean one way at a time, but under heavy traffic in both
-directions about 1 byte in 20000 still goes out corrupted (details below).
-How often depends on the host: on one PC, behind a USB 2 hub, heavy
-two-way traffic went through practically error-free (see
-[Hubs and hosts](#hubs-and-hosts)). So it suits receive-mostly devices, such as a GPS module at 9600 bps,
-request-response protocols and half-duplex links, or anything that
-retransmits on errors. For a serial port you can rely on in every case, a
-USB-serial chip costs less than a dollar, and the
+**Is it useful?** At 1200 to 9600 bps, yes: every test passes, in either
+direction and both at once, with no lost or corrupted bytes. The price is
+throughput when both directions are busy at 9600 bps: the bridge and the
+host take turns on USB, so each way carries about 600 bytes/s instead of
+860, and received bytes can wait up to 20 ms. That is
+[time sharing](#time-sharing-both-directions-at-once), which can be turned
+off for full speed at the cost of the occasional corrupted byte
+(`TIME_SHARING` in the sketch). Above 9600 bps only receiving works.
+
+For a serial port at any rate, a USB-serial chip costs less than a dollar,
+and the
 [DigisparkProBridge](https://github.com/marcocarnut/DigisparkProBridge)
-has a hardware UART.
+has a hardware UART and is lossless to 38400 bps in both directions.
 
 It is also a demonstration of what a fast USB serial library makes possible
 on these boards, and of the techniques involved; the notes below explain
@@ -58,8 +59,11 @@ Plug it in, set the bit rate on the port and use it like any serial port:
 stty -F /dev/ttyACM0 9600 raw -echo
 ```
 
-8N1, 1200 to 9600 bps for both directions; receiving alone also works at
-19200 bps. Two bit rates are commands instead:
+The bit rates it supports are **1200, 2400, 4800 and 9600**, and **19200
+for receiving alone**; any other rate is ignored and the UART keeps the one
+it had (the host is not told). The format is always **8N1**: the data bits,
+parity and stop bits the host asks for are ignored, as are DTR and RTS, and
+there are no CTS or break signals. Two bit rates are commands instead:
 
 - **134 bps** jumps to the micronucleus bootloader, for reflashing without
   replugging.
@@ -114,6 +118,10 @@ the host's transactions, which is why a busy full-duplex link carries a bit
 less than the line rate. The handler keeps running on idle bits for a second
 after the last byte, so the next burst starts with current timing.
 
+That covers the host's own traffic. The data the bridge sends to the host is
+traffic too, and it is up to the bridge when to send it: see
+[Time sharing](#time-sharing-both-directions-at-once).
+
 ### Shorter USB packets: DigiCDCMedium.h
 
 The sketch includes `DigiCDCMedium.h` instead of `DigiCDCFast.h`: 2-byte USB
@@ -122,48 +130,86 @@ for ~73 µs instead of ~110 µs, less than a bit at 9600 bps, which is what
 makes the planning work reliably. It limits USB to about 2000 bytes/s each
 way, plenty for 9600 bps.
 
+### Time sharing: both directions at once
+
+At 9600 bps a transmitted bit lasts 104 us and a USB transaction keeps
+V-USB's interrupts off for ~73 us, so a transaction that starts at the
+wrong moment delays an edge enough to corrupt a byte. Planning bytes around
+the host's transactions (above) handles the host's own traffic, but the
+data the bridge sends to the host is extra traffic at times of the bridge's
+choosing. Transmitting alone is clean; adding traffic the other way is what
+corrupts bytes.
+
+So, with `TIME_SHARING` (on by default), no data goes to the host while a
+byte is being transmitted. Received bytes collect in a 32-byte buffer until
+20 of them wait or the oldest is 20 ms old; then the transmitter finishes
+its byte and holds the line idle while they go to the host, and resumes
+when the host has taken them all. A hold ends after 100 ms regardless, in
+case no program is reading the port. Below 9600 bps nothing is held.
+
+The cost is throughput and a little latency: at 9600 bps with both
+directions saturated, each carries about 600 bytes/s instead of 860, and a
+received byte can wait up to 20 ms. One direction at a time is unaffected.
+To trade that back for speed, set `TIME_SHARING` to 0 at the top of
+`TinyBridge.ino` (330 bytes less flash), and the bridge behaves as it did
+before: a few corrupted bytes per 10 kB transmitted while receiving, on some
+hosts (see below).
+
 ## Results
 
-Against a CH340 USB-serial adapter wired to the bridge, a Linux PC (xHCI),
-with the host sending as fast as the bridge accepts (`bridge_test.py`).
-Bytes corrupted; none lost unless noted:
+Time sharing is on unless the table says otherwise. Against a CH340
+USB-serial adapter wired to the bridge, on a PC (Intel
+xHCI, Linux 6.8) with the board in a port of its own, the host sending as
+fast as the bridge accepts (`bridge_test.py`). Bytes corrupted; none lost
+unless noted; throughput per direction:
 
-| Bit rate | Receive | Transmit | Both directions at once |
-|----------|---------|----------|-------------------------|
-| 1200, 2400 (3 kB) | 0 | 0 | 0 / 0 |
-| 4800 (10 kB) | 0 | 0 | 0 / 0 |
-| 9600 (50 kB) | 0 | 0, 859 bytes/s | receive 0; transmit 1-4 per 50 kB, 856 bytes/s |
-| 19200 (10 kB) | 0 | 56-84 | fails, loses received bytes too |
+| Bit rate | Receive | Transmit | Both at once, time sharing on (default) | Both at once, time sharing off |
+|----------|---------|----------|------------------------------------------|--------------------------------|
+| 1200 (3 kB) | 0, 120 B/s | 0, 120 B/s | 0 / 0, 120 B/s | 0 / 0, 120 B/s |
+| 2400 (3 kB) | 0, 240 B/s | 0, 240 B/s | 0 / 0, 240 B/s | 0 / 0, 240 B/s |
+| 4800 (10 kB) | 0, 481 B/s | 0, 479 B/s | 0 / 0, 479 B/s | 0 / 0, 480 B/s |
+| 9600 (20 kB) | 0, 961 B/s | 0, 859 B/s | 0 / 0, 601 B/s | receive 0; transmit 2, 858 B/s |
+| 9600 (50 kB, 3 runs) | | | 0 / 0, 600 B/s | receive 0; transmit 8, 10, 14; 859 B/s |
+| 19200 (10 kB) | 0, 1921 B/s | 15, 1293 B/s | receive 846 lost, 1271 corrupted; transmit 35 | receive 465 lost, 489 corrupted; transmit 221 |
 
-Other tests at 9600 bps:
+Below 9600 bps time sharing does nothing: the bits are long enough that USB
+traffic can't spoil them, and both directions run at the line rate. At
+19200 bps transmitting is beyond reach either way, and in full duplex the
+receiver loses sample windows: it has 139 us to service them, less than the
+~200 us V-USB can keep interrupts off when it handles a transaction in each
+direction back to back.
+
+Other tests at 9600 bps, with time sharing on except where noted:
 
 - **Bursty traffic** (`burst_test.py`, bursts of up to 100 bytes with
-  50-300 ms pauses, both directions at once): 2 corrupted bytes in 48 kB.
-- **Zmodem** (lrzsz), a 62 kB file each way: both copies identical; 784-836
-  bytes/s through the bridge's transmitter, 911-930 bytes/s through its
-  receiver.
-- **PPP** (`novj`, MTU 296) with iperf3 in both directions: works, with about
-  1.6% of the frames from the bridge failing their checksum and being
-  retransmitted by TCP.
+  50-300 ms pauses, both directions at once): clean, 40 kB each way
+  (2 corrupted bytes in 48 kB with time sharing off).
+- **Zmodem** (lrzsz), a 62 kB file each way, time sharing off: both copies
+  identical; 784-836 bytes/s through the bridge's transmitter, 911-930
+  bytes/s through its receiver.
+- **PPP** (`novj`, MTU 296) with iperf3 in both directions, time sharing
+  off: works, with about 1.6% of the frames from the bridge failing their
+  checksum and being retransmitted by TCP.
 
-The current sketch is smaller than the first release (flash 6638 -> 5998
-bytes, RAM 388 -> 275, with DigiCDCFast 1.1.0) and keeps its planner as it
-was, but fixes a bug in how its transmit handler returned (see
-[Lessons](#lessons-from-the-hardware)). Side by side on the same bench,
-three boots each, at 9600 and 4800 bps: bit rate changes requested right
-after traffic were missed 5 times in 27 by the first release and never by
-the current one; receiving and 4800 bps were clean for both; transmitting
-at 9600 bps in both directions corrupted 12 bytes in 120 kB with the first
-release and 18 with the current one, and bursts 3 and 7 in 72 kB, which is
+The planner is unchanged since the first release, but a bug in how the
+transmit handler returned is fixed (see
+[Lessons](#lessons-from-the-hardware)), and with time sharing off the sketch
+is smaller (flash 6638 -> 6092 bytes, RAM 388 -> 281, with DigiCDCFast
+1.1.0; 6442 and 302 with time sharing). Side by side with the first release
+on the same bench, three boots each, time sharing off: bit rate changes
+requested right after traffic were missed 5 times in 27 by the first
+release and never since; receiving and 4800 bps were clean for both;
+transmitting at 9600 bps in both directions corrupted 12 bytes in 120 kB
+with the first release and 18 since, and bursts 3 and 7 in 72 kB, which is
 within chance.
 
 ### Hubs and hosts
 
-How often transmitted bytes get corrupted in full duplex depends on where
-the host's USB controller places the bridge's transactions in each frame,
-and that changes with the host and with a hub in between. The same sketch
-and adapter at 9600 bps, both directions at once, 50 kB each, three runs per
-setup (`e` is the bridge's count of edges made late, see
+With time sharing off, how often transmitted bytes get corrupted depends on
+where the host's USB controller places the bridge's transactions in each
+frame, and that changes with the host and with a hub in between. The same
+sketch and adapter at 9600 bps, both directions at once, 50 kB each, three
+runs per setup (`e` is the bridge's count of edges made late, see
 [Diagnostics](#diagnostics)):
 
 | Host | Connection | Corrupted bytes to the adapter | Edges made late |
@@ -179,8 +225,9 @@ the transmitter's handlers five times fewer late edges and made full duplex
 practically clean (and slightly faster, 873 bytes/s); on the Raspberry Pi
 the same hub changed nothing. It isn't the Digispark's clock: its frame
 length (`P`) was the same within 0.1% in the best and worst of these
-sessions. So if full duplex matters, try the bridge with and without a hub
-on your host.
+sessions. So if you turn time sharing off and full duplex matters, try the
+bridge with and without a hub on your host. With time sharing on, both
+setups were clean.
 
 Things tried along the way:
 
@@ -223,9 +270,10 @@ and clear them:
   `f` framing errors;
 - TinyBridge also: `k` stack bytes never used, `e` edges made late, `a` USB
   transactions seen, `h` bytes started later, `p` idle bits spent looking,
-  `z` bytes sent after 10 idle bits without a safe place, `P` the USB frame
-  length it measures, in 1/16 Timer1 ticks (4125 with an exact 16.5 MHz
-  clock; 0.1% is about 4),
+  `z` bytes sent after 10 idle bits without a safe place, `r` received bytes
+  dropped because loop() hadn't forwarded them, `w` times transmitting was
+  held for data going to the host, `P` the USB frame length it measures, in
+  1/16 Timer1 ticks (4125 with an exact 16.5 MHz clock; 0.1% is about 4),
   `c` and `b` the CRC-16 (XMODEM) and count of the bytes read from USB, to
   compare with what the host sent;
 - TinyBridgeUsi3x also: `l` glitches, `r` receive buffer overflows.

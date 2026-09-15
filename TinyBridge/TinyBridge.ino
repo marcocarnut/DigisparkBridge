@@ -99,6 +99,7 @@ static bool txIdle;                    // the bit on the line is idle line after
 // received bytes go to the host, then loop() lets it go on.
 #if TIME_SHARING
 static volatile bool txHold, txHeld;
+static bool shareUsb;                  // bits short enough for USB data to the host to corrupt them (9600 bps and up)
 #endif
 static uint16_t txIdleBits;            // idle bits since the last byte
 #define LINGER_BITS 10000              // how long the handler keeps running after the last byte (~1 s at 9600 bps)
@@ -433,6 +434,9 @@ static void uartBegin(const Rate *entry)  // entry: in flash
   bitCycles = r->bitCycles;
   bitTicks = bitCycles >> 6;
   bitFrac = bitCycles & 63;
+#if TIME_SHARING
+  shareUsb = bitTicks < 40;
+#endif
   uint8_t ticks = 0;
   uint16_t frac = 0;  // bitFrac * k / 64 < 9, but k * bitFrac needs 16 bits
   for (uint8_t k = 0; k < 10; k++, ticks += bitTicks, frac += bitFrac)
@@ -625,7 +629,7 @@ void loop()
       txHold = false;
       holdSince = millis();  // and don't hold again for 100 ms
     }
-  } else if (rxCount && sending && (uint16_t)millis() - holdSince >= 100) {
+  } else if (rxCount && sending && shareUsb && (uint16_t)millis() - holdSince >= 100) {
     if (rxCount >= RX_HOLD_BYTES || (uint16_t)millis() - rxSince >= RX_HOLD_MS) {
       COUNT(holds);
       holdSince = millis();
