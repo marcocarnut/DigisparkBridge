@@ -2,7 +2,8 @@
 """Test a USB-UART bridge against a reference USB-serial adapter wired to
 its UART (TX to RX, RX to TX, GND to GND).
 
-usage: bridge_test.py [--bridge PORT] [--adapter PORT] [--bytes N] [--rx-only] [--stats] BAUD...
+usage: bridge_test.py [--bridge PORT] [--adapter PORT] [--bytes N] [--rx-only] [--duplex-only]
+                      [--stats] [--stats-wait SECONDS] BAUD...
 
 For each bit rate: adapter -> bridge, bridge -> adapter, then both at once,
 each with N pseudo-random bytes (default 100000). With --rx-only (for a

@@ -41,7 +41,9 @@ LED on PB1 flickers with the data, which doesn't matter.
 - **Digistump AVR core 1.7.5**, from the board manager URL
   `https://raw.githubusercontent.com/ArminJo/DigistumpArduino/master/package_digistump_index.json`.
   No changes are needed for the ATtiny85.
-- **DigiCDCFast** 1.0.0 or later, from the Arduino Library Manager.
+- **DigiCDCFast** 1.1.0 or later, from the Arduino Library Manager. (The
+  sketch also builds with 1.0.0, with 94 bytes less RAM to spare, but was
+  tested with 1.1.0.)
 - A Digispark with the micronucleus bootloader. Build for its 16.5 MHz
   clock setting: the board definition defaults to 16 MHz, where USB doesn't
   work.
@@ -142,6 +144,17 @@ Other tests at 9600 bps:
   1.6% of the frames from the bridge failing their checksum and being
   retransmitted by TCP.
 
+The current sketch is smaller than the first release (flash 6638 -> 5998
+bytes, RAM 388 -> 275, with DigiCDCFast 1.1.0) and keeps its planner as it
+was, but fixes a bug in how its transmit handler returned (see
+[Lessons](#lessons-from-the-hardware)). Side by side on the same bench,
+three boots each, at 9600 and 4800 bps: bit rate changes requested right
+after traffic were missed 5 times in 27 by the first release and never by
+the current one; receiving and 4800 bps were clean for both; transmitting
+at 9600 bps in both directions corrupted 12 bytes in 120 kB with the first
+release and 18 with the current one, and bursts 3 and 7 in 72 kB, which is
+within chance.
+
 Things tried along the way:
 
 - **8-byte USB packets** (plain `DigiCDCFast.h`): transmit 3-7 corrupted per
@@ -151,6 +164,19 @@ Things tried along the way:
 - **3-byte packets**: as good as 2-byte ones at 9600 bps, and better at
   transmitting at 19200 bps (17-22 corrupted per 10 kB), which still isn't
   usable.
+- **Exact USB timing instead of the handler's late runs.** A variant of
+  DigiCDCFast recorded when V-USB's interrupt ended (an experiment, not
+  published). It showed each frame's
+  transactions at fixed places (in full duplex, an OUT transaction ending at
+  +0 and +13 ticks, an IN one at +39 and +43), so the frame's timing can be
+  known exactly. Planners built on it did no better than the estimate from
+  late runs: seeding the estimate at the start of each burst corrupted 1-6
+  bytes per 48 kB of bursts where the estimate alone corrupted none; planning
+  around one region per frame transmitted cleanly one way but corrupted 7-11
+  per 20 kB in both directions, against ~3; and learning a map of where
+  handlers ran late made the handler too slow and too deep for the ATtiny85.
+  Late runs measure what actually matters, whatever causes it, at almost no
+  cost per edge.
 
 ## The sketches
 
@@ -168,11 +194,14 @@ and clear them:
 
 - `n` bytes received, `g` sample windows lost, `o` capture queue overflows,
   `f` framing errors;
-- TinyBridge also: `e` edges made late, `a` USB transactions seen, `h`
-  bytes started later, `p` idle bits spent looking;
+- TinyBridge also: `k` stack bytes never used, `e` edges made late, `a` USB
+  transactions seen, `h` bytes started later, `p` idle bits spent looking,
+  `c` and `b` the CRC-16 (XMODEM) and count of the bytes read from USB, to
+  compare with what the host sent;
 - TinyBridgeUsi3x also: `l` glitches, `r` receive buffer overflows.
 
-`bridge_test.py --stats` prints them after each transfer.
+`bridge_test.py --stats` prints them after each transfer, with the host's
+own `c` and `b` for the data it sent to the bridge.
 
 ## Tests
 
@@ -181,9 +210,11 @@ RX, RX to TX, GND to GND), and default to `/dev/ttyACM0` for the bridge and
 `/dev/ttyUSB0` for the adapter. They report bytes lost, extra or corrupted,
 with the offsets of the first mismatches.
 
-- `bridge_test.py [--bytes N] [--rx-only] [--stats] BAUD...` sends
-  pseudo-random data one direction at a time, then both at once.
-  `--rx-only` is for the receive-only sketches.
+- `bridge_test.py [--bytes N] [--rx-only] [--duplex-only] [--stats]
+  [--stats-wait SECONDS] BAUD...` sends pseudo-random data one direction at
+  a time, then both at once. `--rx-only` is for the receive-only sketches,
+  `--duplex-only` runs only the test in both directions, and `--stats-wait`
+  sets the quiet time before asking for the counters.
 - `burst_test.py [--bytes N] [--max-burst MAX] [--pause MIN MAX]
   [--direction both|to-bridge|to-adapter] BAUD` sends random bursts with
   random pauses.
@@ -201,7 +232,22 @@ with the offsets of the first mismatches.
   bridge stops sending, its buffer fills, and DigiCDCFast's flow control then
   refuses even the host's line-coding requests.
 - A plain `ISR()` for the transmit handler saved 27 registers with
-  interrupts off (~5 µs), long enough to worry V-USB.
+  interrupts off (~5 µs), long enough to worry V-USB. An entry stub now
+  masks the handler's interrupt and turns interrupts on before saving
+  anything.
+- **The way out matters as much as the way in.** The handler and its stub
+  restored their registers with interrupts off: over 100 CPU cycles after
+  every edge. V-USB must start within about 40 cycles of a packet, and at
+  16.5 MHz it doesn't check CRCs, so a packet arriving then could be misread
+  and accepted. Because the planner keeps the handler at a fixed place in
+  the USB frame, some sessions lost whole 2-byte packets from the host (seen
+  as pairs of corrupted bytes, confirmed by the `c` counter disagreeing with
+  the host), and requests to change the bit rate were lost about half the
+  time right after traffic. Restoring registers with interrupts on, and
+  unmasking the handler's interrupt in one short step at the end, fixed both.
+- A USB-UART bridge makes such bugs hard to see: corrupted data looks like a
+  transmit timing error. Checksumming what the sketch received over USB told
+  the two apart.
 
 ## License and credits
 
