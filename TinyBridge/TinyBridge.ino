@@ -43,11 +43,22 @@
 #include <util/crc16.h>
 
 #define STATS           1    // 1: 110 bps prints and clears diagnostic counters
+#ifndef TIME_SHARING
+#define TIME_SHARING    1    // 1: no USB data to the host while transmitting (reliable full duplex,
+                             //    ~600 bytes/s each way); 0: both at once (~870 bytes/s, some
+                             //    bytes corrupted on some hosts; see README)
+#endif
 #define BOOTLOADER_BAUD 134
 #define STATS_BAUD      110
 #define SAMPLES_PER_BIT 3
 #define CAPTURE_SIZE    16   // 16: its gap flags are the bits of GPIOR1 and GPIOR2
+#if TIME_SHARING
+#define RX_SIZE         32   // powers of 2; received bytes wait here while the transmitter works
+#define RX_HOLD_BYTES   20   // ... until this many,
+#define RX_HOLD_MS      20   // or the oldest is this old
+#else
 #define RX_SIZE         16   // powers of 2
+#endif
 #define TX_SIZE         16
 
 // Bit rates: Timer0 clocks USI at 3 samples per bit (period OCR0A + 1), and a
@@ -82,6 +93,13 @@ static uint8_t txHead;                 // written by loop()
 static volatile uint8_t txTail;        // written by the handler
 static volatile bool txActive;         // an edge is scheduled
 static bool txIdle;                    // the bit on the line is idle line after a stop bit
+// Time sharing: USB data to the host (IN packets) never goes out while a
+// byte is being transmitted. loop() asks the transmitter to hold (txHold);
+// it finishes the byte on the line and sends idle bits (txHeld) while
+// received bytes go to the host, then loop() lets it go on.
+#if TIME_SHARING
+static volatile bool txHold, txHeld;
+#endif
 static uint16_t txIdleBits;            // idle bits since the last byte
 #define LINGER_BITS 10000              // how long the handler keeps running after the last byte (~1 s at 9600 bps)
 static uint16_t txFrame;               // bit 0: the bit on the line, then the rest of the byte
@@ -117,6 +135,7 @@ static bool txMoved;                   // the edge just made was moved later
 static struct {
   uint16_t received, gaps, framingErrors;
   uint16_t forcedEdges, seen, shifted, probed, gaveUp;  // updated by the transmitter
+  uint16_t rxOverflows, holds;
   uint8_t captureOverflows;                     // updated by the receive handler
   uint16_t usbCrc, usbBytes;                    // CRC-XMODEM and count of the bytes read from USB
 } stats;
@@ -311,6 +330,13 @@ extern "C" __attribute__((used)) uint8_t txSchedule(uint8_t edgeMade)
     if (frame == 1) {               // the next edge ends a stop bit
       if (txTail != txHead) {
         frame = 0x600 | (txBuf[txTail] << 1);  // start bit, 8 data bits, stop bit, end marker
+#if TIME_SHARING
+        if (txHold) {
+          txHeld = true;
+          frame = 3;                // an idle bit: received bytes are going to the host
+          txIdle = true;
+        } else
+#endif
         if (txPlan(frame)) {
           txTail = (txTail + 1) & (TX_SIZE - 1);
           txIdle = false;
@@ -399,6 +425,9 @@ static void uartBegin(const Rate *entry)  // entry: in flash
   TIMSK &= ~_BV(OCIE1A);  // abandon a byte being sent
   txActive = false;
   txHead = txTail = 0;
+#if TIME_SHARING
+  txHold = txHeld = false;
+#endif
   TCCR1 = (TCCR1 & ~COM1A_MASK) | COM1A_SET;
   GTCCR |= _BV(FOC1A);    // idle line
   bitCycles = r->bitCycles;
@@ -446,10 +475,11 @@ static void decode(uint8_t s)
       if (s) {               // stop bit high: keep the byte
         uint8_t next = (rxHead + 1) & (RX_SIZE - 1);
         COUNT(received);
-        if (next != rxTail) {  // (loop() forwards faster than bytes arrive)
+        if (next != rxTail) {
           rxBuf[rxHead] = rxByte;
           rxHead = next;
-        }
+        } else
+          COUNT(rxOverflows);
       } else
         COUNT(framingErrors);
       framePos = -1;
@@ -501,6 +531,8 @@ static void printStats()
   writeHex('h', stats.shifted);
   writeHex('p', stats.probed);
   writeHex('z', stats.gaveUp);
+  writeHex('r', stats.rxOverflows);
+  writeHex('w', stats.holds);
   writeHex('P', framePeriod);  // USB frame in 1/16 Timer1 ticks: 4125 with an exact 16.5 MHz clock
   writeHex('c', stats.usbCrc);
   writeHex('b', stats.usbBytes);
@@ -565,6 +597,46 @@ void loop()
       decode(samples & mask);
   }
 
+#if TIME_SHARING
+  // Received bytes go to the host. Each packet keeps V-USB busy, which the
+  // transmitter has to plan around, so they go 8 at a time (or once 4 ms
+  // old), and while there are bytes to transmit they wait for a pause in
+  // transmitting (RX_HOLD_BYTES, or RX_HOLD_MS old).
+  static uint16_t rxSince, holdSince;
+  uint8_t rxCount = (rxHead - rxTail) & (RX_SIZE - 1);
+  if (!rxCount)
+    rxSince = millis();
+  bool sending = txHead != txTail;  // (a byte is on the line, or will be)
+  if (txHold) {
+    if (txHeld || !txActive) {
+      for (int room = SerialUSB.availableForWrite(); room > 0 && rxTail != rxHead; room--) {
+        SerialUSB.write(rxBuf[rxTail]);
+        rxTail = (rxTail + 1) & (RX_SIZE - 1);
+      }
+      if (rxTail == rxHead && SerialUSB.availableForWrite() == pgm_read_byte(&digiCdcBufferSizes[0])
+          && usbInterruptIsReady()) {  // all taken by the host: transmit again
+        txHeld = false;
+        txHold = false;
+        holdSince = millis() - 100;
+      }
+    }
+    if (txHold && (uint16_t)millis() - holdSince >= 100) {  // the host isn't taking data: don't stop transmitting for it
+      txHeld = false;
+      txHold = false;
+      holdSince = millis();  // and don't hold again for 100 ms
+    }
+  } else if (rxCount && sending && (uint16_t)millis() - holdSince >= 100) {
+    if (rxCount >= RX_HOLD_BYTES || (uint16_t)millis() - rxSince >= RX_HOLD_MS) {
+      COUNT(holds);
+      holdSince = millis();
+      txHold = true;
+    }
+  } else if (rxCount >= 8 || (rxCount && (uint16_t)millis() - rxSince >= 4))
+    for (int room = SerialUSB.availableForWrite(); room > 0 && rxTail != rxHead; room--) {
+      SerialUSB.write(rxBuf[rxTail]);
+      rxTail = (rxTail + 1) & (RX_SIZE - 1);
+    }
+#else
   // Received bytes go to the host 8 at a time, or once 4 ms old: each packet
   // keeps V-USB busy, which the transmitter has to plan around
   static uint16_t rxSince;
@@ -575,6 +647,7 @@ void loop()
       SerialUSB.write(rxBuf[rxTail]);
       rxTail = (rxTail + 1) & (RX_SIZE - 1);
     }
+#endif
 
   while (SerialUSB.available()) {
     uint8_t next = (txHead + 1) & (TX_SIZE - 1);
