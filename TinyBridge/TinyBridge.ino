@@ -112,10 +112,12 @@ static bool txMoved;                   // the edge just made was moved later
 
 // Diagnostic counters, printed at STATS_BAUD
 #if STATS
-#define COUNT(counter) (counter++)
-static volatile uint8_t captureOverflows;  // updated by the handler
-static uint16_t gaps, framingErrors, received;
-static uint16_t forcedEdges, seen, shifted, probed;  // updated by the transmitter
+#define COUNT(counter) (stats.counter++)
+static struct {
+  uint16_t received, gaps, framingErrors;
+  uint16_t forcedEdges, seen, shifted, probed;  // updated by the transmitter
+  uint8_t captureOverflows;                     // updated by the receive handler
+} stats;
 #else
 #define COUNT(counter) ((void)0)
 #endif
@@ -389,9 +391,10 @@ static void uartBegin(const Rate *entry)  // entry: in flash
   bitCycles = r->bitCycles;
   bitTicks = bitCycles >> 6;
   bitFrac = bitCycles & 63;
-  uint32_t at = 0;
-  for (uint8_t k = 0; k < 10; k++, at += bitCycles)
-    edgeTicks[k] = at >> 6;
+  uint8_t ticks = 0;
+  uint16_t frac = 0;  // bitFrac * k / 64 < 9, but k * bitFrac needs 16 bits
+  for (uint8_t k = 0; k < 10; k++, ticks += bitTicks, frac += bitFrac)
+    edgeTicks[k] = ticks + (frac >> 6);
   bandBefore = WINDOW_TICKS + HANDLER_TICKS > bitTicks ? WINDOW_TICKS + HANDLER_TICKS - bitTicks : 0;
   USICR = 0;
   TCCR0B = 0;
@@ -468,30 +471,30 @@ static void writeHex(char tag, uint16_t v)
 
 static void printStats()
 {
-  uint8_t o = captureOverflows;
+  cli();
+  uint8_t o = stats.captureOverflows;
+  sei();
   uint16_t unused = 0;  // stack bytes never touched
   for (uint8_t *p = &_end; *p == 0xC5; p++)
     unused++;
   SerialUSB.write('S');
   writeHex('k', unused);
-  writeHex('n', received);
-  writeHex('g', gaps);
+  writeHex('n', stats.received);
+  writeHex('g', stats.gaps);
   writeHex('o', o);
-  writeHex('f', framingErrors);
-  writeHex('e', forcedEdges);
-  writeHex('a', seen);
-  writeHex('h', shifted);
-  writeHex('p', probed);
+  writeHex('f', stats.framingErrors);
+  writeHex('e', stats.forcedEdges);
+  writeHex('a', stats.seen);
+  writeHex('h', stats.shifted);
+  writeHex('p', stats.probed);
   SerialUSB.write('\r');
   SerialUSB.write('\n');
   // Printing kept loop() busy: drop the samples it couldn't decode meanwhile
   cli();
   captureTail = captureHead;
-  captureOverflows = 0;
   framePos = -1;
   lastSample = false;
-  received = gaps = framingErrors = 0;
-  forcedEdges = seen = shifted = probed = 0;
+  memset(&stats, 0, sizeof stats);
   sei();
 }
 #endif
@@ -516,7 +519,7 @@ void loop()
 {
   static uint16_t lineBaud, uartBaud;
   unsigned long rate = SerialUSB.baud();
-  uint16_t baud = rate > 65535 ? 0 : rate;
+  uint16_t baud = rate >> 16 ? 0 : (uint16_t)rate;
   if (baud != lineBaud) {
     lineBaud = baud;
     if (baud == BOOTLOADER_BAUD)
