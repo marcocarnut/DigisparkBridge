@@ -41,22 +41,38 @@
 // full duplex.
 #include <DigiCDCMedium.h>
 
+#define STATS           1    // 1: 110 bps prints and clears diagnostic counters
 #define BOOTLOADER_BAUD 134
-#define STATS_BAUD      110  // diagnostics: print and clear the counters
+#define STATS_BAUD      110
 #define SAMPLES_PER_BIT 3
-#define CAPTURE_SIZE    16  // powers of 2
-#define RX_SIZE         16
+#define CAPTURE_SIZE    16   // 16: its gap flags are the bits of GPIOR1 and GPIOR2
+#define RX_SIZE         16   // powers of 2
 #define TX_SIZE         16
-#define GAP             1   // capture flag: samples were lost before these
 
-// Sample bytes from USI (oldest sample in bit 7) and their flags
-static uint8_t captured[CAPTURE_SIZE], capturedFlags[CAPTURE_SIZE];
+// Bit rates: Timer0 clocks USI at 3 samples per bit (period OCR0A + 1), and a
+// bit lasts `bitCycles` CPU cycles. A table spares the 32-bit arithmetic.
+struct Rate {
+  uint16_t baud;
+  uint8_t ocr0a, prescaler;
+  uint16_t bitCycles;
+};
+static const Rate rates[] PROGMEM = {
+  { 1200,  71, _BV(CS01) | _BV(CS00), 13750},
+  { 2400,  35, _BV(CS01) | _BV(CS00),  6875},
+  { 4800, 142, _BV(CS01),              3438},
+  { 9600,  71, _BV(CS01),              1719},
+  {19200,  35, _BV(CS01),               859},  // receiving only
+};
+
+// Sample bytes from USI (oldest sample in bit 7). A capture's gap flag (samples
+// were lost before it) is bit (slot & 7) of GPIOR1 for slots 0-7, GPIOR2 for
+// 8-15, written only by the handler.
+static uint8_t captured[CAPTURE_SIZE];
 static volatile uint8_t captureHead;
 static uint8_t captureTail;
 
 static uint8_t rxBuf[RX_SIZE];
 static uint8_t rxHead, rxTail;
-static uint8_t prescaler;  // TCCR0B clock select
 
 // Transmitter: the line and the next edge. Times are in Timer1 ticks (64 CPU
 // cycles), modulo 2^16.
@@ -94,18 +110,21 @@ static bool txMoved;                   // the edge just made was moved later
 #define COM1A_CLR  _BV(COM1A1)
 
 
-// Diagnostic counters
+// Diagnostic counters, printed at STATS_BAUD
+#if STATS
+#define COUNT(counter) (counter++)
 static volatile uint8_t captureOverflows;  // updated by the handler
 static uint16_t gaps, framingErrors, received;
 static uint16_t forcedEdges, seen, shifted, probed;  // updated by the transmitter
+#else
+#define COUNT(counter) ((void)0)
+#endif
 
-// V-USB must never wait for this handler, so it masks its own interrupt and
-// lets others in; only the counter update runs with interrupts off.
-ISR(USI_OVF_vect)
+// Collect USI's samples. Runs with USI's interrupt masked, interrupts on;
+// returns with interrupts off.
+extern "C" void rxCapture() __attribute__((used));
+void rxCapture()
 {
-  USICR = _BV(USICS0);  // mask USI's interrupt, keep clocking it from Timer0
-  sei();
-
   // A sample shifting in between reading and rewriting the counter would be
   // lost. It shifts at the compare match, when TCNT0 goes from OCR0A to 0,
   // but USI's counter changes slightly later: with only TCNT0 == OCR0A-1
@@ -119,20 +138,50 @@ ISR(USI_OVF_vect)
   uint8_t samples = USIBR;
   sei();
 
-  static uint8_t lost;
-  uint8_t next = (captureHead + 1) & (CAPTURE_SIZE - 1);
-  captured[captureHead] = samples;
-  capturedFlags[captureHead] = count >= 8 || lost ? GAP : 0;  // too late: a window is lost
-  lost = 0;
-  if (next != captureTail)
-    captureHead = next;
-  else {
-    lost = 1;
-    captureOverflows++;
+  static bool lost;
+  uint8_t slot = captureHead, bit = 1 << (slot & 7);
+  captured[slot] = samples;
+  if (count >= 8 || lost) {  // too late: a window is lost
+    if (slot & 8) GPIOR2 |= bit; else GPIOR1 |= bit;
+  } else {
+    if (slot & 8) GPIOR2 &= ~bit; else GPIOR1 &= ~bit;
   }
+  uint8_t next = (slot + 1) & (CAPTURE_SIZE - 1);
+  lost = next == captureTail;
+  if (!lost)
+    captureHead = next;
+  else
+    COUNT(captureOverflows);
 
   cli();
   USICR = _BV(USICS0) | _BV(USIOIE);
+}
+
+// Entry stub for the transmit handler. V-USB must never wait for it, and the
+// stack is small: it masks its own interrupt and millis()' (whose
+// non-blocking handler would otherwise nest in it, deepening the stack), lets
+// other interrupts in, and only then saves the registers a C function may
+// change. On the way out it puts millis()' interrupt back as it found it. (A
+// plain ISR saved 27 registers with interrupts off.)
+#define STUB_SAVE \
+    "sei\n" \
+    "push r0\n push r1\n clr r1\n" \
+    "push r18\n push r19\n push r20\n push r21\n push r22\n push r23\n" \
+    "push r25\n push r26\n push r27\n push r30\n push r31\n"
+#define STUB_RESTORE \
+    "pop r31\n pop r30\n pop r27\n pop r26\n pop r25\n" \
+    "pop r23\n pop r22\n pop r21\n pop r20\n pop r19\n pop r18\n" \
+    "pop r1\n pop r0\n" \
+    "pop r24\n bst r24, 2\n in r24, 0x39\n bld r24, 2\n out 0x39, r24\n"  /* TOIE1 as it was */ \
+    "pop r24\n out 0x3f, r24\n pop r24\n reti\n"
+
+// A plain handler: an entry stub let the transmit handler nest before the
+// counter is read, which then sometimes came more than 8 samples late
+ISR(USI_OVF_vect)
+{
+  USICR = _BV(USICS0);  // mask USI's interrupt, keep clocking it from Timer0
+  sei();
+  rxCapture();
 }
 
 // Timer1 ticks, counted on from the last call: call at least every 256 ticks
@@ -171,7 +220,7 @@ static void activitySeen(uint16_t end, uint8_t late)
   else if ((int16_t)(lo - start) > 0)
     start = lo;
   activityStart = start;
-  seen++;
+  COUNT(seen);
 }
 
 // How much later a byte (frame, start bit first) must start, in ticks, so
@@ -203,7 +252,7 @@ static bool txPlan(uint16_t frame)
   if ((uint16_t)(now - lastEnd) > STALE_TICKS) {
     if (probeBits) {
       probeBits--;
-      probed++;
+      COUNT(probed);
       return false;
     }
     return true;  // none seen: whatever there is, is short
@@ -226,15 +275,26 @@ static bool txPlan(uint16_t frame)
   idle = 0;
   if (total) {
     txEdge += total;
-    shifted++;
+    COUNT(shifted);
   }
   return true;
 }
 
 // Schedule the next edge after the one on the line. Runs with Timer1's
-// compare interrupt masked and interrupts on; returns with interrupts off.
-static void txSchedule()
+// compare (and millis()') interrupts masked, interrupts on; returns with
+// interrupts off. edgeMade: called from the compare interrupt.
+extern "C" void txSchedule(uint8_t edgeMade) __attribute__((used));
+void txSchedule(uint8_t edgeMade)
 {
+  if (edgeMade) {
+    cli();
+    uint16_t now = ticksNow();
+    sei();
+    int16_t late = now - txEdge;
+    if (!txMoved && late >= SEEN_TICKS && late < 128)
+      activitySeen(now, late);
+    txMoved = false;
+  }
   for (;;) {
     uint16_t frame = txFrame >> 1;  // bit 0: the bit that starts at the next edge
     txAdvance();
@@ -271,7 +331,7 @@ static void txSchedule()
         txEdge = now + 2;
         txEdgeFrac = 0;
       } else {
-        forcedEdges++;
+        COUNT(forcedEdges);
         txMoved = true;
       }
       // Make the edge 2 ticks from now. (Forcing a match with FOC1A right
@@ -284,17 +344,14 @@ static void txSchedule()
   }
 }
 
-ISR(TIMER1_COMPA_vect)  // an edge was made
+ISR(TIMER1_COMPA_vect, ISR_NAKED)  // an edge was made
 {
-  TIMSK &= ~_BV(OCIE1A);  // V-USB must never wait for this handler
-  uint16_t now = ticksNow();
-  sei();
-  int16_t late = now - txEdge;
-  if (!txMoved && late >= SEEN_TICKS && late < 128) {
-    activitySeen(now, late);
-  }
-  txMoved = false;
-  txSchedule();
+  __asm__(
+    "push r24\n in r24, 0x3f\n push r24\n"
+    "in r24, 0x39\n push r24\n andi r24, 0xbb\n out 0x39, r24\n" /* TIMSK: mask OCIE1A, TOIE1 */
+    STUB_SAVE
+    "ldi r24, 1\n rcall txSchedule\n"
+    STUB_RESTORE);
 }
 
 static void txStart()
@@ -314,41 +371,38 @@ static void txStart()
   txEdgeFrac = 0;
   TIFR = _BV(OCF1A);
   sei();
-  txSchedule();
+  txSchedule(0);
   sei();
 }
 
-static void uartBegin(unsigned long baud)
+static void uartBegin(const Rate *entry)  // entry: in flash
 {
-  unsigned long rate = baud * SAMPLES_PER_BIT;
-  unsigned long ticks = (F_CPU / 8 + rate / 2) / rate;
-  prescaler = _BV(CS01);                  // clk/8
-  if (ticks > 256) {
-    ticks = (F_CPU / 64 + rate / 2) / rate;
-    prescaler = _BV(CS01) | _BV(CS00);    // clk/64
-  }
+  Rate rate;
+  memcpy_P(&rate, entry, sizeof rate);
+  const Rate *r = &rate;
   cli();
   TIMSK &= ~_BV(OCIE1A);  // abandon a byte being sent
   txActive = false;
   txHead = txTail = 0;
   TCCR1 = (TCCR1 & ~COM1A_MASK) | COM1A_SET;
   GTCCR |= _BV(FOC1A);    // idle line
-  bitCycles = (F_CPU + baud / 2) / baud;
+  bitCycles = r->bitCycles;
   bitTicks = bitCycles >> 6;
   bitFrac = bitCycles & 63;
-  for (uint8_t k = 0; k < 10; k++)
-    edgeTicks[k] = (k * (unsigned long)bitCycles) >> 6;
+  uint32_t at = 0;
+  for (uint8_t k = 0; k < 10; k++, at += bitCycles)
+    edgeTicks[k] = at >> 6;
   bandBefore = WINDOW_TICKS + HANDLER_TICKS > bitTicks ? WINDOW_TICKS + HANDLER_TICKS - bitTicks : 0;
   USICR = 0;
   TCCR0B = 0;
   TCCR0A = _BV(WGM01);  // CTC: period is OCR0A + 1
-  OCR0A = ticks - 1;
+  OCR0A = r->ocr0a;
   TCNT0 = 0;
   captureHead = captureTail = 0;
   rxHead = rxTail = 0;
   USISR = _BV(USIOIF) | 8;
   USICR = _BV(USICS0) | _BV(USIOIE);
-  TCCR0B = prescaler;
+  TCCR0B = r->prescaler;
   sei();
 }
 
@@ -375,13 +429,13 @@ static void decode(uint8_t s)
     } else {
       if (s) {               // stop bit high: keep the byte
         uint8_t next = (rxHead + 1) & (RX_SIZE - 1);
-        received++;
+        COUNT(received);
         if (next != rxTail) {  // (loop() forwards faster than bytes arrive)
           rxBuf[rxHead] = rxByte;
           rxHead = next;
         }
       } else
-        framingErrors++;
+        COUNT(framingErrors);
       framePos = -1;
     }
   }
@@ -399,6 +453,9 @@ static void enterBootloader()
   ((void (*)())0)();     // micronucleus points the reset vector at itself
 }
 
+#if STATS
+extern uint8_t _end;  // the first byte above the variables: the stack's limit
+
 static void writeHex(char tag, uint16_t v)
 {
   SerialUSB.write(' ');
@@ -412,7 +469,11 @@ static void writeHex(char tag, uint16_t v)
 static void printStats()
 {
   uint8_t o = captureOverflows;
+  uint16_t unused = 0;  // stack bytes never touched
+  for (uint8_t *p = &_end; *p == 0xC5; p++)
+    unused++;
   SerialUSB.write('S');
+  writeHex('k', unused);
   writeHex('n', received);
   writeHex('g', gaps);
   writeHex('o', o);
@@ -433,12 +494,16 @@ static void printStats()
   forcedEdges = seen = shifted = probed = 0;
   sei();
 }
+#endif
 
 void setup()
 {
-  pinMode(PB0, INPUT);
-  digitalWrite(PB1, HIGH);
-  pinMode(PB1, OUTPUT);
+#if STATS
+  for (uint8_t *p = &_end; p < (uint8_t *)SP - 32; p++)  // paint the free stack
+    *p = 0xC5;
+#endif
+  PORTB |= _BV(PB1);  // TX idles high (PB0, RX, is an input from reset)
+  DDRB |= _BV(PB1);
   // Timer1: normal mode, same clock and period for millis(), OC1A sets PB1
   cli();
   TCCR1 = (TCCR1 & 0x0F) | COM1A_SET;
@@ -449,24 +514,29 @@ void setup()
 
 void loop()
 {
-  static unsigned long lineBaud, uartBaud;
-  unsigned long baud = SerialUSB.baud();
+  static uint16_t lineBaud, uartBaud;
+  unsigned long rate = SerialUSB.baud();
+  uint16_t baud = rate > 65535 ? 0 : rate;
   if (baud != lineBaud) {
     lineBaud = baud;
     if (baud == BOOTLOADER_BAUD)
       enterBootloader();
+#if STATS
     else if (baud == STATS_BAUD)
       printStats();
-    else if (baud != uartBaud) {
-      uartBegin(baud);
-      uartBaud = baud;
-    }
+#endif
+    else if (baud != uartBaud)  // other rates leave the UART as it is
+      for (const Rate *r = rates; r < rates + sizeof rates / sizeof *rates; r++)
+        if (pgm_read_word(&r->baud) == baud) {
+          uartBegin(r);
+          uartBaud = baud;
+        }
   }
 
   while (captureTail != captureHead) {
     uint8_t samples = captured[captureTail];
-    if (capturedFlags[captureTail] & GAP) {
-      gaps++;
+    if ((captureTail & 8 ? GPIOR2 : GPIOR1) & (1 << (captureTail & 7))) {
+      COUNT(gaps);
       framePos = -1;         // the byte in progress is incomplete
       lastSample = false;    // wait for the line to be seen idle again
     }
@@ -477,10 +547,10 @@ void loop()
 
   // Received bytes go to the host 8 at a time, or once 4 ms old: each packet
   // keeps V-USB busy, which the transmitter has to plan around
-  static unsigned long rxSince;
+  static uint16_t rxSince;
   if (rxTail == rxHead)
     rxSince = millis();
-  else if (((rxHead - rxTail) & (RX_SIZE - 1)) >= 8 || millis() - rxSince >= 4)
+  else if (((rxHead - rxTail) & (RX_SIZE - 1)) >= 8 || (uint16_t)millis() - rxSince >= 4)
     for (int room = SerialUSB.availableForWrite(); room > 0 && rxTail != rxHead; room--) {
       SerialUSB.write(rxBuf[rxTail]);
       rxTail = (rxTail + 1) & (RX_SIZE - 1);
