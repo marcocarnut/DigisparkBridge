@@ -1,6 +1,6 @@
 # DigisparkBridge
 
-A minimalistic (8N1 only, no flow control) USB-to-UART bridge for the
+A minimalistic (8N1 only, RTS flow control) USB-to-UART bridge for the
 original Digispark (ATtiny85) and limited to 9,600 bps full duplex
 (both directions at once) by taking turns around USB traffic
 (see notes below); receiving alone works up to 19,200 bps.
@@ -34,12 +34,15 @@ explain them.
 |-----------|--------------|
 | PB0 (P0) | TX |
 | PB1 (P1) | RX |
+| PB2 (P2) | CTS (optional, see [Flow control](#flow-control)) |
 | GND | GND |
 
 The Digispark's I/O is at 5 V; use a level shifter for 3.3 V devices. The
 LED on PB1 flickers with the data, which doesn't matter.
 
-No hardware flow control for now (maybe in the future).
+PB2 asks the other device to pause when the bridge's buffer fills; leave it
+unconnected if the device has no CTS input. There is no CTS input on the
+bridge's side: it has no pin left for one.
 
 ## Requirements
 
@@ -101,10 +104,14 @@ Two settings at the top of `TinyBridge.ino`:
   corrupts a byte now and then, and saves 350 bytes of flash.
 - `STATS` (1): the diagnostic counters and the 110 bps command that prints
   them (see [Diagnostics](#diagnostics)). 0 saves 722 bytes of flash and 25
-  bytes of RAM.
+  bytes of RAM. With `WIDE_STATS` (0) the byte counters are 32-bit, printed
+  as two halves (`N`/`n`, `B`/`b`), at 52 bytes of flash: they wrap at 65535
+  otherwise.
+- `FLOW_CONTROL` (1): PB2 as an RTS output (see
+  [Flow control](#flow-control)), 20 bytes of flash.
 
-With both on the sketch uses 6542 of the 6650 bytes available; with both off,
-5514.
+With the defaults the sketch uses 6570 of the 6650 bytes available; without
+the counters, 5848.
 
 ## How it works
 
@@ -229,6 +236,31 @@ transmitting at 9600 bps in both directions corrupted 12 bytes in 120 kB
 with the first release and 18 since, and bursts 3 and 7 in 72 kB, which is
 within chance.
 
+### Flow control
+
+The bridge has 32 bytes to hold what it receives until USB takes it. If the
+host stops reading its port, that fills, and the bytes that arrive next are
+lost (counter `r`: 20 kB sent to a port nobody read lost 15956 of them).
+
+PB2 prevents that, if the other device has a CTS input: the bridge holds it
+low while it can take data, and raises it once 22 bytes are waiting, until
+the buffer is down to 8 again. Wired to an FT232R's CTS, with `crtscts` set
+on that side, the same test lost nothing: the adapter paused, accepting
+8704 bytes in 150 s while the host read nothing, and the bridge's `r`
+stayed 0.
+
+Not every adapter obeys CTS. A CH340 kept sending regardless (and dropped
+16793 bytes), because Linux's `ch341` driver accepts `crtscts` without
+implementing it; the bridge's line was correct all the while, as the
+adapter's own CTS pin showed. Set `FLOW_CONTROL` to 0 in the sketch to leave
+PB2 alone (20 bytes of flash).
+
+The other direction, a device asking the *bridge* to pause, would need a
+pin the ATtiny85 doesn't have to spare here: PB0, PB1 and PB2 are the UART
+and RTS, PB3 and PB4 are USB, and PB5 is reset unless the fuses are changed.
+The host's own flow control needs no pin: when the bridge can't take more,
+USB makes the host wait.
+
 ### When a byte fits nowhere
 
 A byte whose level changes at many edges sometimes can't be placed safely
@@ -322,9 +354,10 @@ and clear them:
 - TinyBridgeUsi3x also: `l` glitches, `r` receive buffer overflows.
 
 All of them are 16-bit and wrap silently, so `n` reads 34464 after 100000
-bytes. `r` rises when the host stops reading the port: the bridge has
-nowhere to put what keeps arriving and no way to ask the other device to
-stop (20 kB sent to a port nobody read: 15956 dropped). Ask for the counters
+bytes, unless `WIDE_STATS` is set (see [Build options](#build-options)). `r`
+rises when the host stops reading the port and the other device keeps
+sending without watching the bridge's RTS (see
+[Flow control](#flow-control)). Ask for the counters
 with the port drained, or the line comes back truncated: the host's buffer
 is then full, and DigiCDCFast drops what it can't deliver after 50 ms.
 

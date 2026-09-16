@@ -122,6 +122,11 @@ static uint8_t edgeTicks[10];          // edge k of a byte, ticks after its star
 #define HANDLER_TICKS 10                // a handler's own run time
 #define STALE_TICKS  4096              // after 16 ms without seeing activity, look again
 #define PROBE_BITS   11                // idle bits spent looking, before a byte
+#ifndef FLOW_CONTROL
+#define FLOW_CONTROL 1   // 1: PB2 is an RTS output (low: the other device may send)
+#endif
+#define RTS_HIGH  (RX_SIZE - 10)  // stop it with this many received bytes waiting,
+#define RTS_LOW   8               // let it send again with this many
 #ifndef IDLE_LIMIT
 #define IDLE_LIMIT   40                // idle bits a byte may wait for a safe place (4 ms at 9600 bps)
 #endif
@@ -139,13 +144,23 @@ static bool txMoved;                   // the edge just made was moved later
 
 // Diagnostic counters, printed at STATS_BAUD
 #if STATS
+#ifndef WIDE_STATS
+#define WIDE_STATS 0     // 1: the byte counters (n, b) are 32-bit, printed as two halves
+#endif
+#if WIDE_STATS
+#define COUNTER uint32_t
+#else
+#define COUNTER uint16_t
+#endif
 #define COUNT(counter) (stats.counter++)
 static struct {
-  uint16_t received, gaps, framingErrors;
+  COUNTER received;                             // bytes: 16 bits wrap in a long test
+  uint16_t gaps, framingErrors;
   uint16_t forcedEdges, seen, shifted, probed, gaveUp;  // updated by the transmitter
   uint16_t rxOverflows, holds;
   uint8_t captureOverflows;                     // updated by the receive handler
-  uint16_t usbCrc, usbBytes;                    // CRC-XMODEM and count of the bytes read from USB
+  uint16_t usbCrc;                              // CRC-XMODEM of the bytes read from USB
+  COUNTER usbBytes;
 } stats;
 #else
 #define COUNT(counter) ((void)0)
@@ -538,6 +553,9 @@ static void printStats()
     unused++;
   SerialUSB.write('S');
   writeHex('k', unused);
+#if WIDE_STATS
+  writeHex('N', stats.received >> 16);
+#endif
   writeHex('n', stats.received);
   writeHex('g', stats.gaps);
   writeHex('o', o);
@@ -551,6 +569,9 @@ static void printStats()
   writeHex('w', stats.holds);
   writeHex('P', framePeriod);  // USB frame in 1/16 Timer1 ticks: 4125 with an exact 16.5 MHz clock
   writeHex('c', stats.usbCrc);
+#if WIDE_STATS
+  writeHex('B', stats.usbBytes >> 16);
+#endif
   writeHex('b', stats.usbBytes);
   SerialUSB.write('\r');
   SerialUSB.write('\n');
@@ -588,6 +609,10 @@ void setup()
 #endif
   PORTB |= _BV(PB1);  // TX idles high (PB0, RX, is an input from reset)
   DDRB |= _BV(PB1);
+#if FLOW_CONTROL
+  PORTB &= ~_BV(PB2);  // RTS: the other device may send
+  DDRB |= _BV(PB2);
+#endif
   // Timer1: normal mode, same clock and period for millis(), OC1A sets PB1
   cli();
   TCCR1 = (TCCR1 & 0x0F) | COM1A_SET;
@@ -638,6 +663,14 @@ void loop()
   uint8_t rxCount = (rxHead - rxTail) & (RX_SIZE - 1);
   if (!rxCount)
     rxSince = millis();
+#if FLOW_CONTROL
+  // Ask the other device to pause before the buffer is full, and to go on
+  // once it has drained (its CTS input; low means it may send)
+  if (rxCount >= RTS_HIGH)
+    PORTB |= _BV(PB2);
+  else if (rxCount <= RTS_LOW)
+    PORTB &= ~_BV(PB2);
+#endif
   bool sending = txHead != txTail;  // (a byte is on the line, or will be)
   if (txHold) {
     if (txHeld || !txActive || txHead == txTail) {
