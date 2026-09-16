@@ -255,11 +255,14 @@ implementing it; the bridge's line was correct all the while, as the
 adapter's own CTS pin showed. Set `FLOW_CONTROL` to 0 in the sketch to leave
 PB2 alone (20 bytes of flash).
 
-The other direction, a device asking the *bridge* to pause, would need a
-pin the ATtiny85 doesn't have to spare here: PB0, PB1 and PB2 are the UART
-and RTS, PB3 and PB4 are USB, and PB5 is reset unless the fuses are changed.
-The host's own flow control needs no pin: when the bridge can't take more,
-USB makes the host wait.
+The other direction, a device asking the *bridge* to pause, isn't
+implemented: there is no pin left. PB0, PB1 and PB2 are the UART and RTS,
+PB3 and PB4 are USB, and PB5 is the reset pin, usable as an input only after
+burning RSTDISBL, which costs in-circuit programming and leaves micronucleus
+as the only way back (a damaged bootloader then needs a high-voltage
+programmer). That seemed a poor trade for a bridge that transmits at most
+860 bytes/s into devices that usually have a UART buffer. The host needs no
+pin either way: when the bridge can't take more, USB makes it wait.
 
 ### When a byte fits nowhere
 
