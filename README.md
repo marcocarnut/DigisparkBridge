@@ -107,11 +107,11 @@ Two settings at the top of `TinyBridge.ino`:
   bytes of RAM. With `WIDE_STATS` (0) the byte counters are 32-bit, printed
   as two halves (`N`/`n`, `B`/`b`), at 52 bytes of flash: they wrap at 65535
   otherwise.
-- `FLOW_CONTROL` (1): PB2 as an RTS output (see
-  [Flow control](#flow-control)), 20 bytes of flash.
+- `RTS_OUTPUT` (0): PB2 as an RTS output (see
+  [Flow control](#flow-control)), 20 bytes of flash. Off unless you wire it.
 
-With the defaults the sketch uses 6576 of the 6650 bytes available; without
-the counters, 5854. (Four of those bytes are DigiCDCFast's transaction-end
+With the defaults the sketch uses 6556 of the 6650 bytes available; without
+the counters, 5834. (Four of those bytes are DigiCDCFast's transaction-end
 hook, which this sketch does not use; `USB_CFG_TRANSACTION_END_HOOK` in the
 library's `usbconfig.h` removes it. Measured with it either way, the bridge
 behaves identically: same throughput, no corruption, the same counters.)
@@ -245,8 +245,8 @@ The bridge has 32 bytes to hold what it receives until USB takes it. If the
 host stops reading its port, that fills, and the bytes that arrive next are
 lost (counter `r`: 20 kB sent to a port nobody read lost 15956 of them).
 
-PB2 prevents that, if the other device has a CTS input: the bridge holds it
-low while it can take data, and raises it once 22 bytes are waiting, until
+PB2 prevents that, with `RTS_OUTPUT` set to 1 and the other device's CTS
+wired to it: the bridge holds it low while it can take data, and raises it once 22 bytes are waiting, until
 the buffer is down to 8 again. Wired to an FT232R's CTS, with `crtscts` set
 on that side, the same test lost nothing: the adapter paused, accepting
 8704 bytes in 150 s while the host read nothing, and the bridge's `r`
@@ -255,8 +255,9 @@ stayed 0.
 Not every adapter obeys CTS. A CH340 kept sending regardless (and dropped
 16793 bytes), because Linux's `ch341` driver accepts `crtscts` without
 implementing it; the bridge's line was correct all the while, as the
-adapter's own CTS pin showed. Set `FLOW_CONTROL` to 0 in the sketch to leave
-PB2 alone (20 bytes of flash).
+adapter's own CTS pin showed. PB2 is left alone until `RTS_OUTPUT` is set to
+1 in the sketch (20 bytes of flash), so that a board with nothing wired to it
+behaves as it always did.
 
 The other direction, a device asking the *bridge* to pause, isn't
 implemented: there is no pin left. PB0, PB1 and PB2 are the UART and RTS,

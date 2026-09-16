@@ -122,8 +122,8 @@ static uint8_t edgeTicks[10];          // edge k of a byte, ticks after its star
 #define HANDLER_TICKS 10                // a handler's own run time
 #define STALE_TICKS  4096              // after 16 ms without seeing activity, look again
 #define PROBE_BITS   11                // idle bits spent looking, before a byte
-#ifndef FLOW_CONTROL
-#define FLOW_CONTROL 1   // 1: PB2 is an RTS output (low: the other device may send)
+#ifndef RTS_OUTPUT
+#define RTS_OUTPUT   0   // 1: PB2 is an RTS output (low: the other device may send)
 #endif
 #define RTS_HIGH  (RX_SIZE - 10)  // stop it with this many received bytes waiting,
 #define RTS_LOW   8               // let it send again with this many
@@ -609,7 +609,7 @@ void setup()
 #endif
   PORTB |= _BV(PB1);  // TX idles high (PB0, RX, is an input from reset)
   DDRB |= _BV(PB1);
-#if FLOW_CONTROL
+#if RTS_OUTPUT
   PORTB &= ~_BV(PB2);  // RTS: the other device may send
   DDRB |= _BV(PB2);
 #endif
@@ -663,7 +663,7 @@ void loop()
   uint8_t rxCount = (rxHead - rxTail) & (RX_SIZE - 1);
   if (!rxCount)
     rxSince = millis();
-#if FLOW_CONTROL
+#if RTS_OUTPUT
   // Ask the other device to pause before the buffer is full, and to go on
   // once it has drained (its CTS input; low means it may send)
   if (rxCount >= RTS_HIGH)
