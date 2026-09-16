@@ -209,9 +209,13 @@ Other tests at 9600 bps, with time sharing on except where noted:
 - **Zmodem** (lrzsz), a 62 kB file each way, time sharing off: both copies
   identical; 784-836 bytes/s through the bridge's transmitter, 911-930
   bytes/s through its receiver.
-- **PPP** (`novj`, MTU 296) with iperf3 in both directions, time sharing
-  off: works, with about 1.6% of the frames from the bridge failing their
-  checksum and being retransmitted by TCP.
+- **PPP** (`pppd` at both ends, MTU/MRU 296, `novj`, `nocrtscts`), a 62 kB
+  file over TCP in each direction at once: **no frame errors either way**,
+  85 kB carried each way. The transfer into the host finishes well before
+  the one out of it, since time sharing gives receiving priority. (Earlier
+  runs showed 6-14 bad frames per 95 kB from the bridge, all of them bytes
+  the planner gave up on; see
+  [When a byte fits nowhere](#when-a-byte-fits-nowhere).)
 
 The planner is unchanged since the first release, but a bug in how the
 transmit handler returned is fixed (see
@@ -224,6 +228,22 @@ release and never since; receiving and 4800 bps were clean for both;
 transmitting at 9600 bps in both directions corrupted 12 bytes in 120 kB
 with the first release and 18 since, and bursts 3 and 7 in 72 kB, which is
 within chance.
+
+### When a byte fits nowhere
+
+A byte whose level changes at many edges sometimes can't be placed safely
+anywhere in the frame. The planner then sends idle bits and tries again, and
+after `IDLE_LIMIT` of them (40, about 4 ms at 9600 bps) it gives up and
+sends the byte where it is, corrupted now and then. The limit has to exist:
+without it the bridge would stop sending, its buffers would fill, and
+DigiCDCFast's flow control would then refuse even the host's line-coding
+requests.
+
+The limit was 10 idle bits until it turned out to be the main source of
+errors under PPP: every corrupted byte in a long test was one of these
+(counter `z`). At 40 the counter stays at 0 in the same tests, and
+throughput is unchanged (601 bytes/s each way in both directions at once).
+Raising it further only delays a stubborn byte more.
 
 ### Hubs and hosts
 
@@ -292,13 +312,21 @@ and clear them:
   `f` framing errors;
 - TinyBridge also: `k` stack bytes never used, `e` edges made late, `a` USB
   transactions seen, `h` bytes started later, `p` idle bits spent looking,
-  `z` bytes sent after 10 idle bits without a safe place, `r` received bytes
-  dropped because loop() hadn't forwarded them, `w` times transmitting was
-  held for data going to the host, `P` the USB frame length it measures, in
-  1/16 Timer1 ticks (4125 with an exact 16.5 MHz clock; 0.1% is about 4),
+  `z` bytes sent without a safe place (see
+  [When a byte fits nowhere](#when-a-byte-fits-nowhere)), `r` received bytes
+  dropped for want of room, `w` times transmitting was held for data going
+  to the host, `P` the USB frame length it measures, in 1/16 Timer1 ticks
+  (4125 with an exact 16.5 MHz clock; 0.1% is about 4),
   `c` and `b` the CRC-16 (XMODEM) and count of the bytes read from USB, to
   compare with what the host sent;
 - TinyBridgeUsi3x also: `l` glitches, `r` receive buffer overflows.
+
+All of them are 16-bit and wrap silently, so `n` reads 34464 after 100000
+bytes. `r` rises when the host stops reading the port: the bridge has
+nowhere to put what keeps arriving and no way to ask the other device to
+stop (20 kB sent to a port nobody read: 15956 dropped). Ask for the counters
+with the port drained, or the line comes back truncated: the host's buffer
+is then full, and DigiCDCFast drops what it can't deliver after 50 ms.
 
 `bridge_test.py --stats` prints them after each transfer, with the host's
 own `c` and `b` for the data it sent to the bridge.
