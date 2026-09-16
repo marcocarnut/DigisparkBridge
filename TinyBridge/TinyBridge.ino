@@ -115,11 +115,16 @@ static uint8_t edgeTicks[10];          // edge k of a byte, ticks after its star
 // USB activity: the host's transactions come every millisecond, and V-USB
 // keeps interrupts off while it handles them (measured: one or two stretches
 // per millisecond, each starting at the same point)
+#ifndef WINDOW_TICKS
 #define WINDOW_TICKS 52                // activity to plan around, found best by testing (200 us)
+#endif
 #define SEEN_TICKS   8                 // a handler this late (31 us) was held by activity
 #define HANDLER_TICKS 10                // a handler's own run time
 #define STALE_TICKS  4096              // after 16 ms without seeing activity, look again
 #define PROBE_BITS   11                // idle bits spent looking, before a byte
+#ifndef IDLE_LIMIT
+#define IDLE_LIMIT   40                // idle bits a byte may wait for a safe place (4 ms at 9600 bps)
+#endif
 static uint16_t activityStart;         // when the latest activity started (estimated)
 static uint16_t lastEnd;               // when the latest activity seen ended
 static uint16_t framePeriod = 16500 / 4;  // USB frame period, 1/16 ticks
@@ -293,12 +298,15 @@ static bool txPlan(uint16_t frame)
   while ((int16_t)(start - txEdge) <= -(int16_t)bandBefore)
     start += period;
   // Start later until safe. Beyond 128 ticks (OCR1A's reach), send an idle
-  // bit and plan again; a byte that fits nowhere goes after 10 idle bits.
+  // bit and plan again; a byte that fits nowhere goes anyway after
+  // IDLE_LIMIT idle bits, corrupted now and then, rather than stopping the
+  // bridge (its buffers fill, and DigiCDCFast's flow control then refuses
+  // even the host's line-coding requests).
   static uint8_t idle;
   uint8_t total = 0;
   for (uint8_t shift; (shift = shiftNeeded(frame, start - txEdge - total)); total += shift)
     if (total + shift > 128) {
-      if (++idle < 10)
+      if (++idle < IDLE_LIMIT)
         return false;
       COUNT(gaveUp);  // sent where it doesn't fit
       total = 0;
