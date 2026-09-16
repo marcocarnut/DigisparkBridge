@@ -331,15 +331,17 @@ extern "C" __attribute__((used)) uint8_t txSchedule(uint8_t edgeMade)
     uint16_t frame = txFrame >> 1;  // bit 0: the bit that starts at the next edge
     txAdvance();
     if (frame == 1) {               // the next edge ends a stop bit
+#if TIME_SHARING
+      // Between bytes, so loop() can send received ones to the host: say so
+      // whether or not a byte is waiting, or it would wait for the timeout
+      if (txHold) {
+        txHeld = true;
+        frame = 3;                  // an idle bit
+        txIdle = true;
+      } else
+#endif
       if (txTail != txHead) {
         frame = 0x600 | (txBuf[txTail] << 1);  // start bit, 8 data bits, stop bit, end marker
-#if TIME_SHARING
-        if (txHold) {
-          txHeld = true;
-          frame = 3;                // an idle bit: received bytes are going to the host
-          txIdle = true;
-        } else
-#endif
         if (txPlan(frame)) {
           txTail = (txTail + 1) & (TX_SIZE - 1);
           txIdle = false;
@@ -630,7 +632,7 @@ void loop()
     rxSince = millis();
   bool sending = txHead != txTail;  // (a byte is on the line, or will be)
   if (txHold) {
-    if (txHeld || !txActive) {
+    if (txHeld || !txActive || txHead == txTail) {
       for (int room = SerialUSB.availableForWrite(); room > 0 && rxTail != rxHead; room--) {
         SerialUSB.write(rxBuf[rxTail]);
         rxTail = (rxTail + 1) & (RX_SIZE - 1);
