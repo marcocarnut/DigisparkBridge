@@ -1,9 +1,9 @@
 # DigisparkBridge
 
-An minimalistic (8N1 only, no flow control) USB-to-UART bridge for the
+A minimalistic (8N1 only, no flow control) USB-to-UART bridge for the
 original Digispark (ATtiny85) and limited to 9,600 bps full duplex
 (both directions at once) by taking turns around USB traffic
-(see notes below); receiving alone works up to 19,200 bps. 
+(see notes below); receiving alone works up to 19,200 bps.
 Which is not too shabby for a device that has no UART
 at all: it receives with the USI peripheral, oversampling in hardware, and
 transmits with bit edges timed by a timer's compare output,
@@ -39,7 +39,7 @@ explain them.
 The Digispark's I/O is at 5 V; use a level shifter for 3.3 V devices. The
 LED on PB1 flickers with the data, which doesn't matter.
 
-No hardware flow control for now (maybe in the future)
+No hardware flow control for now (maybe in the future).
 
 ## Requirements
 
@@ -90,6 +90,21 @@ arduino-cli compile --fqbn digistump:avr:digispark-tiny:clock=clock165 --output-
 stty -F /dev/ttyACM0 134        # only if a bridge is already running
 ~/.arduino15/packages/digistump/tools/micronucleus/2.6/micronucleus --run build/TinyBridge.ino.hex
 ```
+
+### Build options
+
+Two settings at the top of `TinyBridge.ino`:
+
+- `TIME_SHARING` (1): hold data going to the host while transmitting, for
+  reliable full duplex at 9600 bps (see
+  [Time sharing](#time-sharing-both-directions-at-once)). 0 is faster and
+  corrupts a byte now and then, and saves 350 bytes of flash.
+- `STATS` (1): the diagnostic counters and the 110 bps command that prints
+  them (see [Diagnostics](#diagnostics)). 0 saves 722 bytes of flash and 25
+  bytes of RAM.
+
+With both on the sketch uses 6542 of the 6650 bytes available; with both off,
+5514.
 
 ## How it works
 

@@ -42,7 +42,9 @@
 #include <DigiCDCMedium.h>
 #include <util/crc16.h>
 
+#ifndef STATS
 #define STATS           1    // 1: 110 bps prints and clears diagnostic counters
+#endif
 #ifndef TIME_SHARING
 #define TIME_SHARING    1    // 1: no USB data to the host while transmitting (reliable full duplex,
                              //    ~600 bytes/s each way); 0: both at once (~870 bytes/s, some
