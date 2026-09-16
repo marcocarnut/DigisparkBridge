@@ -110,8 +110,11 @@ Two settings at the top of `TinyBridge.ino`:
 - `FLOW_CONTROL` (1): PB2 as an RTS output (see
   [Flow control](#flow-control)), 20 bytes of flash.
 
-With the defaults the sketch uses 6570 of the 6650 bytes available; without
-the counters, 5848.
+With the defaults the sketch uses 6576 of the 6650 bytes available; without
+the counters, 5854. (Six of those bytes are DigiCDCFast's transaction-end
+hook, which this sketch does not use; `USB_CFG_TRANSACTION_END_HOOK` in the
+library's `usbconfig.h` removes it. Measured with it either way, the bridge
+behaves identically: same throughput, no corruption, the same counters.)
 
 ## How it works
 
