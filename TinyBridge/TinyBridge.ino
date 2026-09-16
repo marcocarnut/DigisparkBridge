@@ -552,6 +552,22 @@ static void printStats()
 }
 #endif
 
+// Refuse bit rates the bridge can't provide: DigiCDCFast then answers the
+// host's request with a STALL and keeps reporting the settings in use. (The
+// data bits, parity and stop bits are not checked: the UART is always 8N1.)
+extern "C" uint8_t digiCdcAcceptLineCoding(const uint8_t *coding)
+{
+  if (coding[2] | coding[3])  // above 65535 bps
+    return 0;
+  uint16_t baud = coding[0] | coding[1] << 8;
+  if (baud == BOOTLOADER_BAUD || baud == STATS_BAUD)
+    return 1;
+  for (const Rate *r = rates; r < rates + sizeof rates / sizeof *rates; r++)
+    if (pgm_read_word(&r->baud) == baud)
+      return 1;
+  return 0;
+}
+
 void setup()
 {
 #if STATS

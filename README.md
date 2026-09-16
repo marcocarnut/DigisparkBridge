@@ -1,8 +1,10 @@
 # DigisparkBridge
 
-An experimental USB-to-UART bridge for the original Digispark (ATtiny85)
-but limited to 9,600 bps, both directions at once, by taking turns on USB
-(see notes below); receiving alone works up to 19,200 bps. Which is not too shabby for a device that has no UART
+An minimalistic (8N1 only, no flow control) USB-to-UART bridge for the
+original Digispark (ATtiny85) and limited to 9,600 bps full duplex
+(both directions at once) by taking turns around USB traffic
+(see notes below); receiving alone works up to 19,200 bps. 
+Which is not too shabby for a device that has no UART
 at all: it receives with the USI peripheral, oversampling in hardware, and
 transmits with bit edges timed by a timer's compare output,
 while [DigiCDCFast](https://github.com/marcocarnut/DigiCDCFast) runs
@@ -18,13 +20,13 @@ off for full speed at the cost of the occasional corrupted byte
 (`TIME_SHARING` in the sketch). Above 9600 bps only receiving works.
 
 For a serial port at any rate, a USB-serial chip costs less than a dollar,
-and the
-[DigisparkProBridge](https://github.com/marcocarnut/DigisparkProBridge)
+and the [DigisparkProBridge](https://github.com/marcocarnut/DigisparkProBridge)
 has a hardware UART and is lossless to 38400 bps in both directions.
 
-It is also a demonstration of what a fast USB serial library makes possible
-on these boards, and of the techniques involved; the notes below explain
-them.
+It is also a demonstration of what a fast USB serial library like
+[DigiCDCFast](https://github.com/marcocarnut/DigiCDCFast) makes
+possible on these boards, and of the techniques involved; the notes below
+explain them.
 
 ## Wiring
 
@@ -37,6 +39,8 @@ them.
 The Digispark's I/O is at 5 V; use a level shifter for 3.3 V devices. The
 LED on PB1 flickers with the data, which doesn't matter.
 
+No hardware flow control for now (maybe in the future)
+
 ## Requirements
 
 - **Linux host.** Windows refuses low-speed USB serial devices; see
@@ -44,9 +48,8 @@ LED on PB1 flickers with the data, which doesn't matter.
 - **Digistump AVR core 1.7.5**, from the board manager URL
   `https://raw.githubusercontent.com/ArminJo/DigistumpArduino/master/package_digistump_index.json`.
   No changes are needed for the ATtiny85.
-- **DigiCDCFast** 1.1.0 or later, from the Arduino Library Manager. (The
-  sketch also builds with 1.0.0, with 94 bytes less RAM to spare, but was
-  tested with 1.1.0.)
+- **DigiCDCFast** 1.2.0 or later, from the Arduino Library Manager (1.1.0
+  works too, except that unsupported bit rates are then accepted silently).
 - A Digispark with the micronucleus bootloader. Build for its 16.5 MHz
   clock setting: the board definition defaults to 16 MHz, where USB doesn't
   work.
@@ -60,10 +63,14 @@ stty -F /dev/ttyACM0 9600 raw -echo
 ```
 
 The bit rates it supports are **1200, 2400, 4800 and 9600**, and **19200
-for receiving alone**; any other rate is ignored and the UART keeps the one
-it had (the host is not told). The format is always **8N1**: the data bits,
-parity and stop bits the host asks for are ignored, as are DTR and RTS, and
-there are no CTS or break signals. Two bit rates are commands instead:
+for receiving alone**. Any other rate is refused: the bridge answers the
+host's request with a STALL, as the CDC specification asks, and keeps the
+rate it had. Linux doesn't pass that on, so `stty` still reports success and
+the host then believes a rate the bridge isn't using; a program can check by
+reading the settings back from the device. The format is always **8N1**: the
+data bits, parity and stop bits the host asks for are ignored, as are DTR
+and RTS, and there are no CTS or break signals. Two bit rates are commands
+instead:
 
 - **134 bps** jumps to the micronucleus bootloader, for reflashing without
   replugging.
