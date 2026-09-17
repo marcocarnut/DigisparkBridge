@@ -150,7 +150,7 @@ static volatile uint8_t txTail;        // written by the handler
 // run of USB transactions can outlast a bit. EDGE_READY says the stash is
 // valid; the handler clears it while it programs, so the hook cannot land in
 // the middle of that, and the hook clears it when it uses the stash.
-static uint8_t nextOcr, nextTccr;
+extern "C" { uint8_t usbEdgeOcr, usbEdgeTccr; }
 
 #define txFlags    GPIOR0
 #define TX_ACTIVE  _BV(0)  // an edge is scheduled
@@ -159,7 +159,7 @@ static uint8_t nextOcr, nextTccr;
 #define TX_HOLD    _BV(3)  // loop() has asked the transmitter to hold
 #define TX_HELD    _BV(4)  // ... and it has, between bytes
 #define SHARE_USB  _BV(5)  // bits short enough for USB data to the host to corrupt them
-#define EDGE_READY _BV(6)  // nextOcr/nextTccr hold the edge after the timer's
+#define EDGE_READY _BV(6)  // usbEdgeOcr/usbEdgeTccr hold the edge after the timer's
 // Time sharing: USB data to the host (IN packets) never goes out while a
 // byte is being transmitted. loop() asks the transmitter to hold (txHold);
 // it finishes the byte on the line and sends idle bits (txHeld) while
@@ -419,36 +419,6 @@ static bool txPlan(uint16_t frame)
 // compare (and millis()') interrupts masked, interrupts on. Returns the TIMSK
 // bit to unmask (OCIE1A, or 0 when done). edgeMade: called from the compare
 // interrupt.
-// Called by DigiCDCFast at the end of every USB transaction, with the driver's
-// registers already saved: r0, r16-r22, Y and the flags are ours, nothing
-// else. While a run of transactions holds the processor the handler cannot
-// run, so the edge it would have loaded is loaded here instead -- the one
-// thing that can be done from inside someone else's interrupt. Every
-// instruction here delays the packet already arriving, so there are nine.
-extern "C" void usbTransactionEnd() __attribute__((naked, used, externally_visible));
-void usbTransactionEnd()
-{
-  asm volatile(
-      "        sbis %[flags], %[ready]  \n"  // nothing stashed: nothing to do
-      "        ret                      \n"
-      "        in   r16, %[tifr]        \n"
-      "        sbrs r16, %[ocf]         \n"  // the timer's edge has not fired yet
-      "        ret                      \n"
-      "        lds  r16, %[tccr]        \n"  // the level the stashed edge makes
-      "        out  %[tccr1], r16       \n"
-      "        lds  r16, %[ocr]         \n"
-      "        out  %[ocr1a], r16       \n"
-      "        ldi  r16, %[ocfbit]      \n"  // the handler is not wanted for the
-      "        out  %[tifr], r16        \n"  // edge just made, but for the next
-      "        cbi  %[flags], %[ready]  \n"
-      "        ret                      \n"
-      :
-      : [flags] "I"(_SFR_IO_ADDR(GPIOR0)), [ready] "I"(6),
-        [tifr] "I"(_SFR_IO_ADDR(TIFR)), [ocf] "I"(OCF1A),
-        [ocfbit] "M"(_BV(OCF1A)), [tccr1] "I"(_SFR_IO_ADDR(TCCR1)),
-        [ocr1a] "I"(_SFR_IO_ADDR(OCR1A)), [tccr] "i"(&nextTccr), [ocr] "i"(&nextOcr));
-}
-
 extern "C" __attribute__((used)) uint8_t txSchedule(uint8_t edgeMade)
 {
   if (edgeMade) {
@@ -539,8 +509,8 @@ extern "C" __attribute__((used)) uint8_t txSchedule(uint8_t edgeMade)
     // handler's own are: a forced edge does not move those that follow.
     if ((frame >> 1) != 1) {
       uint8_t frac = txEdgeFrac + bitFrac;
-      nextOcr = (uint8_t)(txEdge + bitTicks + (frac >> 6));
-      nextTccr = (TCCR1 & ~COM1A_MASK) | ((frame >> 1) & 1 ? COM1A_SET : COM1A_CLR);
+      usbEdgeOcr = (uint8_t)(txEdge + bitTicks + (frac >> 6));
+      usbEdgeTccr = (TCCR1 & ~COM1A_MASK) | ((frame >> 1) & 1 ? COM1A_SET : COM1A_CLR);
       stashed = true;
       txFlags |= EDGE_READY;
     }
