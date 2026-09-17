@@ -87,9 +87,9 @@ DIGICDC_BUFFERS(8, 8);
 #define STARTS_1STOP    0x400  // the frame's value while its start bit is next
 #define STARTS_2STOP    0x800
 #if AB_TEST                  //    switched at run time, to interleave the two
-static uint16_t frameBase = FRAME_1STOP, frameStarts = STARTS_1STOP;
-#define FRAME_OF(b)     (frameBase | ((b) << 1))
-#define FRAME_STARTS    frameStarts
+static bool hookArmed = true;  // 150 bps leaves the stash unarmed, 200 arms it
+#define FRAME_OF(b)     (FRAME_1STOP | ((b) << 1))
+#define FRAME_STARTS    STARTS_1STOP
 #elif STOP_BITS == 2
 #define FRAME_OF(b)     (FRAME_2STOP | ((b) << 1))
 #define FRAME_STARTS    STARTS_2STOP
@@ -507,7 +507,11 @@ extern "C" __attribute__((used)) uint8_t txSchedule(uint8_t edgeMade)
     // Stash the edge after this one, if it needs no planning -- which is to
     // say anywhere inside a byte. The times are the scheduled ones, as the
     // handler's own are: a forced edge does not move those that follow.
+#if AB_TEST
+    if (hookArmed && (frame >> 1) != 1) {
+#else
     if ((frame >> 1) != 1) {
+#endif
       uint8_t frac = txEdgeFrac + bitFrac;
       usbEdgeOcr = (uint8_t)(txEdge + bitTicks + (frac >> 6));
       usbEdgeTccr = (TCCR1 & ~COM1A_MASK) | ((frame >> 1) & 1 ? COM1A_SET : COM1A_CLR);
@@ -683,19 +687,21 @@ static void printStats()
   writeHex('N', stats.received >> 16);
 #endif
   writeHex('n', stats.received);
+#if !SPAN_STATS
   writeHex('g', stats.gaps);
   writeHex('o', o);
   writeHex('f', stats.framingErrors);
-  writeHex('e', stats.forcedEdges);
   writeHex('a', stats.seen);
   writeHex('h', stats.shifted);
   writeHex('p', stats.probed);
+#endif
+  writeHex('e', stats.forcedEdges);
   writeHex('z', stats.gaveUp);
   writeHex('r', stats.rxOverflows);
   writeHex('w', stats.holds);
   writeHex('H', stats.hooked);
 #if AB_TEST
-  writeHex('F', frameBase);  // which frame format is in force
+  writeHex('F', hookArmed);  // whether the stash was armed
 #endif
 #if SPAN_STATS
   writeHex('D', stats.worstShift);
@@ -799,10 +805,8 @@ void loop()
       printStats();
 #endif
 #if AB_TEST
-    else if (baud == AB_SLOW || baud == AB_FAST) {
-      frameBase = baud == AB_SLOW ? FRAME_1STOP : FRAME_2STOP;
-      frameStarts = baud == AB_SLOW ? STARTS_1STOP : STARTS_2STOP;
-    }
+    else if (baud == AB_SLOW || baud == AB_FAST)
+      hookArmed = baud == AB_FAST;
 #endif
     else if (baud != uartBaud)  // other rates leave the UART as it is
       for (const Rate *r = rates; r < rates + sizeof rates / sizeof *rates; r++)
