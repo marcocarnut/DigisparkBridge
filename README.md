@@ -35,7 +35,7 @@ explain them.
 | PB0 (P0) | TX |
 | PB1 (P1) | RX |
 | PB2 (P2) | CTS (optional, see [Flow control](#flow-control)) |
-| PB5 (P5) | RTS (optional, and needs RSTDISBL burned, see below) |
+| PB5 (P5) | RTS (optional; read the warning under [Flow control](#flow-control) first) |
 | GND | GND |
 
 The Digispark's I/O is at 5 V; use a level shifter for 3.3 V devices. The
@@ -97,26 +97,32 @@ stty -F /dev/ttyACM0 134        # only if a bridge is already running
 
 ### Build options
 
-Two settings at the top of `TinyBridge.ino`:
+Four settings at the top of `TinyBridge.ino`:
 
 - `TIME_SHARING` (1): hold data going to the host while transmitting, for
   reliable full duplex at 9600 bps (see
   [Time sharing](#time-sharing-both-directions-at-once)). 0 is faster and
   corrupts a byte now and then, and saves 350 bytes of flash.
-- `STATS` (1): the diagnostic counters and the 110 bps command that prints
-  them (see [Diagnostics](#diagnostics)). 0 saves 722 bytes of flash and 25
-  bytes of RAM. With `WIDE_STATS` (0) the byte counters are 32-bit, printed
-  as two halves (`N`/`n`, `B`/`b`), at 52 bytes of flash: they wrap at 65535
-  otherwise.
+- `STATS` (0): the diagnostic counters and the 110 bps command that prints
+  them (see [Diagnostics](#diagnostics)). They cost 726 bytes of flash and 25
+  of RAM, and this sketch has been measured with none of either to spare, so
+  they are off unless you are measuring something. With `WIDE_STATS` (0) the
+  byte counters are 32-bit, printed as two halves (`N`/`n`, `B`/`b`), at 60
+  bytes of flash: they wrap at 65535 otherwise.
 - `RTS_OUTPUT` (0): PB2 as an RTS output (see
-  [Flow control](#flow-control)), 20 bytes of flash. Off unless you wire it.
+  [Flow control](#flow-control)), 20 bytes of flash. Harmless if you switch
+  it on without wiring it: the bridge drives a pin nobody reads.
 - `CTS_INPUT` (0): PB5 as a CTS input (see
-  [Flow control](#flow-control)), 10 bytes of flash. Off unless you wire it,
-  and it needs the reset pin given up first.
+  [Flow control](#flow-control)), 10 bytes of flash. **Switch this on only
+  with the wire, and only on a board whose reset pin has been given up**: see
+  the warnings under [Flow control](#flow-control). With it on and nothing
+  driving PB5, the pull-up reads "wait" and the bridge never sends a byte --
+  it still receives, so the link looks half dead rather than broken.
 
-With the defaults the sketch uses 6494 of the 6650 bytes available and 296
-of the 512 bytes of RAM; without the counters, 5768 and 271; with both flow
-control lines, 6502 and 296; with `WIDE_STATS`, 6554 and 300. (Four of those bytes are DigiCDCFast's transaction-end
+With the defaults the sketch uses 5768 of the 6650 bytes available and 271 of
+the 512 bytes of RAM; with the counters, 6494 and 296; with the counters and
+both flow control lines, 6502 and 296; with `WIDE_STATS` as well, 6554 and
+300. (Four of those bytes are DigiCDCFast's transaction-end
 hook, which this sketch does not use; `USB_CFG_TRANSACTION_END_HOOK` in the
 library's `usbconfig.h` removes it. Measured with it either way, the bridge
 behaves identically: same throughput, no corruption, the same counters.)
@@ -207,6 +213,13 @@ unless noted; throughput per direction:
 | 4800 (10 kB) | 0, 481 B/s | 0, 479 B/s | 0 / 0, 479 B/s | 0 / 0, 480 B/s |
 | 9600 (20 kB) | 0, 961 B/s | 0, 859 B/s | 0 / 0, 601 B/s | receive 0; transmit 2, 858 B/s |
 | 9600 (50 kB, 3 runs) | | | 0 / 0, 600 B/s | receive 0; transmit 8, 10, 14; 859 B/s |
+
+Later, with the shipping defaults (counters off) against an FT232R, five
+rounds of 20 kB each way at 9600 bps: every test passed but one, which
+corrupted a single transmitted byte -- about one in 100 kB. Nothing was ever
+lost. The counters cost RAM this sketch measurably needs, which is why they
+are off, but it also means a build with them on is not quite the build you
+ship: this one is close to the edge either way.
 | 19200 (10 kB) | 0, 1921 B/s | 15, 1293 B/s | receive 846 lost, 1271 corrupted; transmit 35 | receive 465 lost, 489 corrupted; transmit 221 |
 
 Below 9600 bps time sharing does nothing: the bits are long enough that USB
@@ -265,17 +278,32 @@ adapter's own CTS pin showed. PB2 is left alone until `RTS_OUTPUT` is set to
 behaves as it always did.
 
 The other direction, a device asking the *bridge* to pause, is `CTS_INPUT` on
-PB5, and it costs the reset pin: PB0, PB1 and PB2 are the UART and RTS, PB3
-and PB4 are USB, and PB5 is reset until RSTDISBL is burned. That leaves
-micronucleus as the only way in, and a high-voltage programmer as the only
-way back if the bootloader is ever damaged. For a bridge that transmits at
-most 860 bytes/s into devices that usually have a UART buffer, it is rarely
-worth it.
+PB5 -- and it needs a board whose reset pin has been given up. PB0, PB1 and
+PB2 are the UART and RTS, PB3 and PB4 are USB, and PB5 is the reset pin
+unless the `RSTDISBL` fuse is programmed (AVR fuses read 0 when programmed,
+so RSTDISBL = 0 is what you want).
+
+> **Check the fuse before wiring anything to P5.** On a board where RSTDISBL
+> is not programmed, P5 is still the reset pin, and reset is active low --
+> which is the same level the other device's RTS uses to say "go ahead". Wire
+> them together and the board sits in reset exactly when it is being told it
+> may send. It will look dead, not slow. Some Digisparks are said to ship
+> with the fuse programmed and many clones, "rev3" boards among them, not, so
+> read it rather than assume it.
+
+Programming it costs the reset pin for good: micronucleus becomes the only
+way in, and a high-voltage programmer (an ISP one cannot do it) the only way
+back if the bootloader is ever damaged. For a bridge that transmits at most
+860 bytes/s into devices that usually have a UART buffer, it is rarely worth
+it.
 
 With it wired and switched on, the bridge finishes the byte it is sending and
 stops while PB5 is high; `loop()` starts the transmitter again when it goes
 low. Told to wait by an FT232R's RTS driven by hand, the bridge sent 0 bytes,
 and then all 200 of them in order and intact once let go (`cts_test.py`).
+With `CTS_INPUT` on and nothing driving PB5, the pin's pull-up reads "wait"
+and the bridge never transmits, while still receiving normally: switch it on
+only together with the wire.
 
 **It leaves the sketch little room to spare, though.** The ATtiny85 build
 runs close to the edge of its RAM: the `k` counter, which reports the stack
@@ -368,8 +396,9 @@ Things tried along the way:
 
 ## Diagnostics
 
-Setting the port to 110 bps makes the sketch print a line of hex counters
-and clear them:
+With `STATS` set to 1 at the top of the sketch (it ships at 0, since the
+counters cost RAM the sketch has little of), setting the port to 110 bps
+makes it print a line of hex counters and clear them:
 
 - `n` bytes received, `g` sample windows lost, `o` capture queue overflows,
   `f` framing errors;
