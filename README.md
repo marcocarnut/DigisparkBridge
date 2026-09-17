@@ -35,6 +35,7 @@ explain them.
 | PB0 (P0) | TX |
 | PB1 (P1) | RX |
 | PB2 (P2) | CTS (optional, see [Flow control](#flow-control)) |
+| PB5 (P5) | RTS (optional, and needs RSTDISBL burned, see below) |
 | GND | GND |
 
 The Digispark's I/O is at 5 V; use a level shifter for 3.3 V devices. The
@@ -109,9 +110,12 @@ Two settings at the top of `TinyBridge.ino`:
   otherwise.
 - `RTS_OUTPUT` (0): PB2 as an RTS output (see
   [Flow control](#flow-control)), 20 bytes of flash. Off unless you wire it.
+- `CTS_INPUT` (0): PB5 as a CTS input (see
+  [Flow control](#flow-control)), 10 bytes of flash. Off unless you wire it,
+  and it needs the reset pin given up first.
 
 With the defaults the sketch uses 6556 of the 6650 bytes available; without
-the counters, 5834. (Four of those bytes are DigiCDCFast's transaction-end
+the counters, 5834; with both flow control lines, 6586. (Four of those bytes are DigiCDCFast's transaction-end
 hook, which this sketch does not use; `USB_CFG_TRANSACTION_END_HOOK` in the
 library's `usbconfig.h` removes it. Measured with it either way, the bridge
 behaves identically: same throughput, no corruption, the same counters.)
@@ -259,14 +263,32 @@ adapter's own CTS pin showed. PB2 is left alone until `RTS_OUTPUT` is set to
 1 in the sketch (20 bytes of flash), so that a board with nothing wired to it
 behaves as it always did.
 
-The other direction, a device asking the *bridge* to pause, isn't
-implemented: there is no pin left. PB0, PB1 and PB2 are the UART and RTS,
-PB3 and PB4 are USB, and PB5 is the reset pin, usable as an input only after
-burning RSTDISBL, which costs in-circuit programming and leaves micronucleus
-as the only way back (a damaged bootloader then needs a high-voltage
-programmer). That seemed a poor trade for a bridge that transmits at most
-860 bytes/s into devices that usually have a UART buffer. The host needs no
-pin either way: when the bridge can't take more, USB makes it wait.
+The other direction, a device asking the *bridge* to pause, is `CTS_INPUT` on
+PB5, and it costs the reset pin: PB0, PB1 and PB2 are the UART and RTS, PB3
+and PB4 are USB, and PB5 is reset until RSTDISBL is burned. That leaves
+micronucleus as the only way in, and a high-voltage programmer as the only
+way back if the bootloader is ever damaged. For a bridge that transmits at
+most 860 bytes/s into devices that usually have a UART buffer, it is rarely
+worth it.
+
+With it wired and switched on, the bridge finishes the byte it is sending and
+stops while PB5 is high; `loop()` starts the transmitter again when it goes
+low. Told to wait by an FT232R's RTS driven by hand, the bridge sent 0 bytes,
+and then all 200 of them in order and intact once let go (`cts_test.py`).
+
+**It leaves the sketch with no room to spare, though.** The ATtiny85 build
+runs close to the edge of its RAM: the `k` counter, which reports the stack
+bytes never touched, ranges from about 20 to 140 between runs with everything
+else equal, and with `CTS_INPUT` on it was seen at 0 -- the stack reaching the
+first byte past the globals, without yet passing it. No test lost or
+corrupted anything at 9600 bps because of it, but this is not much of a
+margin to spend. Building with `STATS` at 0 gives back 722 bytes of flash and
+25 of RAM, at the price of the counters that would tell you.
+
+Nothing needs to be told to the host, and CDC has no way to tell it: the
+`SERIAL_STATE` notification carries carrier, ring, break, framing, parity and
+overrun, and no CTS bit. It is not needed either: when the bridge can't take
+more, USB makes the host wait.
 
 ### When a byte fits nowhere
 
@@ -383,6 +405,9 @@ with the offsets of the first mismatches.
   a time, then both at once. `--rx-only` is for the receive-only sketches,
   `--duplex-only` runs only the test in both directions, and `--stats-wait`
   sets the quiet time before asking for the counters.
+- `cts_test.py [--baud N] [--bytes N]` drives the adapter's RTS by hand,
+  rather than leaving it to the kernel's flow control, and checks that the
+  bridge stops while told to wait and loses nothing when let go.
 - `burst_test.py [--bytes N] [--max-burst MAX] [--pause MIN MAX]
   [--direction both|to-bridge|to-adapter] BAUD` sends random bursts with
   random pauses.

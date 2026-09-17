@@ -127,6 +127,18 @@ static uint8_t edgeTicks[10];          // edge k of a byte, ticks after its star
 #endif
 #define RTS_HIGH  (RX_SIZE - 10)  // stop it with this many received bytes waiting,
 #define RTS_LOW   8               // let it send again with this many
+#ifndef CTS_INPUT
+#define CTS_INPUT    0   // 1: PB5 is a CTS input, and the bridge only sends while
+                         //    it is low. Needs RSTDISBL burned, which costs the
+                         //    reset pin: micronucleus becomes the only way in, and
+                         //    a high-voltage programmer the only way back. The pin
+                         //    is pulled up, so unwired it would read "wait".
+#endif
+#if CTS_INPUT
+#define maySend() (!(PINB & _BV(PB5)))
+#else
+#define maySend() true   // the compiler then drops every test of it
+#endif
 #ifndef IDLE_LIMIT
 #define IDLE_LIMIT   40                // idle bits a byte may wait for a safe place (4 ms at 9600 bps)
 #endif
@@ -363,7 +375,7 @@ extern "C" __attribute__((used)) uint8_t txSchedule(uint8_t edgeMade)
         txIdle = true;
       } else
 #endif
-      if (txTail != txHead) {
+      if (txTail != txHead && maySend()) {
         frame = 0x600 | (txBuf[txTail] << 1);  // start bit, 8 data bits, stop bit, end marker
         if (txPlan(frame)) {
           txTail = (txTail + 1) & (TX_SIZE - 1);
@@ -613,6 +625,9 @@ void setup()
   PORTB &= ~_BV(PB2);  // RTS: the other device may send
   DDRB |= _BV(PB2);
 #endif
+#if CTS_INPUT
+  PORTB |= _BV(PB5);   // CTS input with its pull-up (PB5 is reset until RSTDISBL)
+#endif
   // Timer1: normal mode, same clock and period for millis(), OC1A sets PB1
   cli();
   TCCR1 = (TCCR1 & 0x0F) | COM1A_SET;
@@ -725,7 +740,9 @@ void loop()
 #endif
     txHead = next;
   }
-  if (!txActive && txHead != txTail) {
+  // While the other device says wait, the transmitter runs out its idle bits
+  // and stops; this is what picks it up again once the line goes low.
+  if (!txActive && txHead != txTail && maySend()) {
     cli();
     txStart();
   }
