@@ -222,6 +222,26 @@ with the shipping defaults: nothing lost, nothing corrupted. The same rounds
 with `STATS` at 0 corrupted two transmitted bytes, which is how we learned
 that the counters are part of what the transmitter's timing was tuned
 around.
+
+### Frames, which are harder than streams
+
+Protocols do not send streams; they send frames with gaps, and the bridge
+carries those less well. `frame_test.py` measures it: 170-byte frames 30 ms
+apart, both directions at once. Over 80 runs of 20 s with a fresh boot before
+each -- 748 kB transmitted, 1.6 MB received -- **2.5 bytes per 100 kB were
+corrupted on the way out, and not one of the 1.6 MB coming in**. Most runs are
+perfectly clean; the bad ones come in episodes lasting minutes, during which a
+run can corrupt hundreds of bytes, and no counter the bridge keeps says
+anything is wrong. That is what a PPP link over this bridge runs into: TCP
+retransmits the frames, so it works, but it is not free.
+
+Anyone measuring this should know that one run tells you nothing. The same
+firmware gave 6.0 and 446.7 corrupted per 100 kB in two consecutive sets of
+20 runs. Comparing two configurations means interleaving them run by run in
+one binary (`AB_TEST` in the sketch does this for the hold thresholds): done
+that way, holding at 8 bytes / 8 ms measured 4.3 per 100 kB against 0.8 for
+the 20/20 the sketch ships with, over 40 runs each -- the opposite of what the
+same comparison said when the two were measured one after the other.
 | 19200 (10 kB) | 0, 1921 B/s | 15, 1293 B/s | receive 846 lost, 1271 corrupted; transmit 35 | receive 465 lost, 489 corrupted; transmit 221 |
 
 Below 9600 bps time sharing does nothing: the bits are long enough that USB

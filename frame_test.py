@@ -201,6 +201,10 @@ def main():
                          "behaves differently from one boot to the next")
     ap.add_argument("--direction", default="both",
                     choices=["both", "to-adapter", "to-bridge"])
+    ap.add_argument("--modes", default="",
+                    help="bit rates to cycle as mode commands, one per run "
+                         "(the sketch acts on them); interleaving two "
+                         "configurations is the only fair way to compare them")
     ap.add_argument("--label", default="")
     ap.add_argument("--out", default="")
     args = ap.parse_args()
@@ -209,20 +213,27 @@ def main():
           f" {args.gap:g} ms apart, {args.baud} bps, {args.direction}"
           f"{', rebooting between runs' if args.reboot else ''}"
           f"{'  [' + args.label + ']' if args.label else ''}", flush=True)
+    modes = [int(m) for m in args.modes.split(",")] if args.modes else []
     runs = []
     for i in range(args.runs):
         if args.reboot and i:
             if not reboot(args.bridge):
                 print("  the bridge did not come back", flush=True)
                 break
+        mode = modes[i % len(modes)] if modes else None
+        if mode:  # a bit rate the sketch reads as a command, like 110 for counters
+            subprocess.run(["stty", "-F", args.bridge, str(mode)], check=False,
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            time.sleep(0.5)
         counters(args.bridge, args.baud)  # clear
         result = one_run(args, seed=1000 + i)
+        result["mode"] = mode
         result["counters"] = counters(args.bridge, args.baud)
         runs.append(result)
         if result.get("gone"):
             print(f"  run {i + 1}: THE BRIDGE LEFT THE BUS", flush=True)
             continue
-        line = f"  run {i + 1}: "
+        line = f"  run {i + 1}{f' [{mode}]' if mode else ''}: "
         for name in ("transmit", "receive"):
             if name in result:
                 r = result[name]
@@ -235,6 +246,16 @@ def main():
         print(line, flush=True)
 
     print()
+    for mode in (modes or [None]):
+        sel = [r for r in runs if r.get("mode") == mode and "transmit" in r]
+        if not sel or not modes:
+            continue
+        bad = [r["transmit"]["corrupted"] for r in sel]
+        tot = sum(r["transmit"]["bytes"] for r in sel)
+        print(f"mode {mode}: {sum(bad)} corrupted in {tot} bytes over {len(sel)} runs"
+              f"  ->  {sum(bad)/tot*100000:.1f} per 100 kB;"
+              f" runs affected {sum(1 for b in bad if b)}/{len(sel)},"
+              f" worst {max(bad)}")
     for name in ("transmit", "receive"):
         vals = [r[name] for r in runs if name in r]
         gone = sum(1 for r in runs if r.get("gone"))

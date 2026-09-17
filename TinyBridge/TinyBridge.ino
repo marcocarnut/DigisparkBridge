@@ -76,6 +76,19 @@ DIGICDC_BUFFERS(8, 8);
 #ifndef RX_HOLD_MS
 #define RX_HOLD_MS      20   // or the oldest is this old
 #endif
+#ifndef AB_TEST
+#define AB_TEST         0    // 1: 150 and 200 bps switch the two thresholds
+#endif                       //    between 20/20 and 8/8, to compare them in
+#if AB_TEST                  //    one binary, interleaved, without reflashing
+static uint8_t holdBytes = RX_HOLD_BYTES, holdMs = RX_HOLD_MS;
+#define HOLD_BYTES holdBytes
+#define HOLD_MS    holdMs
+#define AB_SLOW    150
+#define AB_FAST    200
+#else
+#define HOLD_BYTES RX_HOLD_BYTES
+#define HOLD_MS    RX_HOLD_MS
+#endif
 #else
 #define RX_SIZE         16   // powers of 2
 #endif
@@ -652,6 +665,10 @@ extern "C" uint8_t digiCdcAcceptLineCoding(const uint8_t *coding)
   uint16_t baud = coding[0] | coding[1] << 8;
   if (baud == BOOTLOADER_BAUD || baud == STATS_BAUD)
     return 1;
+#if AB_TEST
+  if (baud == AB_SLOW || baud == AB_FAST)
+    return 1;
+#endif
   for (const Rate *r = rates; r < rates + sizeof rates / sizeof *rates; r++)
     if (pgm_read_word(&r->baud) == baud)
       return 1;
@@ -693,6 +710,11 @@ void loop()
 #if STATS
     else if (baud == STATS_BAUD)
       printStats();
+#endif
+#if AB_TEST
+    else if (baud == AB_SLOW || baud == AB_FAST) {
+      holdBytes = holdMs = baud == AB_SLOW ? RX_HOLD_BYTES : 8;
+    }
 #endif
     else if (baud != uartBaud)  // other rates leave the UART as it is
       for (const Rate *r = rates; r < rates + sizeof rates / sizeof *rates; r++)
@@ -751,7 +773,7 @@ void loop()
       holdSince = millis();  // and don't hold again for 100 ms
     }
   } else if (rxCount && sending && (txFlags & SHARE_USB) && (uint16_t)millis() - holdSince >= 100) {
-    if (rxCount >= RX_HOLD_BYTES || (uint16_t)millis() - rxSince >= RX_HOLD_MS) {
+    if (rxCount >= HOLD_BYTES || (uint16_t)millis() - rxSince >= HOLD_MS) {
       COUNT(holds);
       holdSince = millis();
       txFlags |= TX_HOLD;
