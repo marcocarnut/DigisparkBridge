@@ -76,7 +76,8 @@ data bits, parity and stop bits the host asks for are ignored, as are DTR
 and RTS, and there are no CTS or break signals. Two bit rates are commands
 instead:
 
-- **134 bps** jumps to the micronucleus bootloader, for reflashing without
+- **134 bps, asked for three times within two seconds**, jumps to the
+  micronucleus bootloader, for reflashing without
   replugging.
 - **110 bps** prints diagnostic counters as hex and clears them, leaving the
   UART as it was (see [Diagnostics](#diagnostics)).

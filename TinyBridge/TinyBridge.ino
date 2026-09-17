@@ -655,6 +655,11 @@ static void printStats()
 }
 #endif
 
+// Set by digiCdcAcceptLineCoding() once 134 bps has been asked for three times
+static volatile bool bootWanted;
+static uint16_t bootAsked;
+static uint8_t bootTimes;
+
 // Refuse bit rates the bridge can't provide: DigiCDCFast then answers the
 // host's request with a STALL and keeps reporting the settings in use. (The
 // data bits, parity and stop bits are not checked: the UART is always 8N1.)
@@ -663,7 +668,20 @@ extern "C" uint8_t digiCdcAcceptLineCoding(const uint8_t *coding)
   if (coding[2] | coding[3])  // above 65535 bps
     return 0;
   uint16_t baud = coding[0] | coding[1] << 8;
-  if (baud == BOOTLOADER_BAUD || baud == STATS_BAUD)
+  if (baud == BOOTLOADER_BAUD) {
+    // Three requests within two seconds, not one. V-USB cannot check a packet's
+    // CRC at 16.5 MHz, so a request caught late is accepted as whatever it
+    // looks like -- and one that looks like this used to drop the bridge into
+    // the bootloader in the middle of a session. Asking three times is
+    // something a host does on purpose and noise does not.
+    if ((uint16_t)millis() - bootAsked > 2000)
+      bootTimes = 0;
+    bootAsked = millis();
+    if (++bootTimes >= 3)
+      bootWanted = true;
+    return 1;
+  }
+  if (baud == STATS_BAUD)
     return 1;
 #if AB_TEST
   if (baud == AB_SLOW || baud == AB_FAST)
@@ -700,13 +718,16 @@ void setup()
 
 void loop()
 {
+  if (bootWanted)
+    enterBootloader();
+
   static uint16_t lineBaud, uartBaud;
   unsigned long rate = SerialUSB.baud();
   uint16_t baud = rate >> 16 ? 0 : (uint16_t)rate;
   if (baud != lineBaud) {
     lineBaud = baud;
     if (baud == BOOTLOADER_BAUD)
-      enterBootloader();
+      ;  // only after it has been asked for three times: see below
 #if STATS
     else if (baud == STATS_BAUD)
       printStats();
