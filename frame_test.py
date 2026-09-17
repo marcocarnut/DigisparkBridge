@@ -40,7 +40,7 @@ import tty
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from bridge_test import align
 
-COUNTERS = ("k", "n", "g", "o", "f", "e", "a", "h", "p", "z", "r", "w", "P", "c", "b")
+COUNTERS = ("k", "n", "g", "o", "f", "e", "a", "h", "p", "z", "r", "w", "v", "L", "P", "c", "b")
 
 
 def open_port(path, baud):
@@ -230,7 +230,7 @@ def main():
                          f" lost of {r['bytes']}; ")
         c = result["counters"]
         if c:
-            line += " ".join(f"{k}={c[k]}" for k in ("e", "w", "z", "r", "k", "P")
+            line += " ".join(f"{k}={c[k]}" for k in ("e", "v", "L", "w", "z", "r", "k", "P")
                              if k in c)
         print(line, flush=True)
 

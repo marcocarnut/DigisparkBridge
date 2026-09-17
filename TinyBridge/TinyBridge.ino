@@ -39,7 +39,18 @@
 // (~73 us) then stay shorter than a bit at 9600 bps. With 8-byte packets
 // (~110 us) the planning alone still let ~1 byte in 1000 through corrupted in
 // full duplex.
+#ifndef USB_PACKET_SIZE
+#define USB_PACKET_SIZE 2  // bytes per USB packet: the smaller, the shorter
+#endif                     // V-USB holds the processor, and the less it carries
+#if USB_PACKET_SIZE == 2
 #include <DigiCDCMedium.h>
+#else
+#include <DigiCDCFast.h>
+#include <DigiCDCDescriptor.h>
+const uchar digiCdcConfigDescriptor[DIGICDC_DESCRIPTOR_SIZE] PROGMEM =
+    DIGICDC_CONFIG_DESCRIPTOR(USB_PACKET_SIZE, USB_PACKET_SIZE);
+DIGICDC_BUFFERS(8, 8);
+#endif
 #include <util/crc16.h>
 
 #ifndef STATS
@@ -59,8 +70,12 @@
 #define CAPTURE_SIZE    16   // 16: its gap flags are the bits of GPIOR1 and GPIOR2
 #if TIME_SHARING
 #define RX_SIZE         32   // powers of 2; received bytes wait here while the transmitter works
+#ifndef RX_HOLD_BYTES
 #define RX_HOLD_BYTES   20   // ... until this many,
+#endif
+#ifndef RX_HOLD_MS
 #define RX_HOLD_MS      20   // or the oldest is this old
+#endif
 #else
 #define RX_SIZE         16   // powers of 2
 #endif
@@ -178,6 +193,8 @@ static struct {
   uint16_t gaps, framingErrors;
   uint16_t forcedEdges, seen, shifted, probed, gaveUp;  // updated by the transmitter
   uint16_t rxOverflows, holds;
+  uint16_t veryLate;                            // edges late by more than a quarter bit
+  uint8_t worstLate;                            // and the worst of them, in ticks
   uint8_t captureOverflows;                     // updated by the receive handler
   uint16_t usbCrc;                              // CRC-XMODEM of the bytes read from USB
   COUNTER usbBytes;
@@ -412,13 +429,16 @@ extern "C" __attribute__((used)) uint8_t txSchedule(uint8_t edgeMade)
     OCR1A = txEdge;
     cli();
     uint16_t now = ticksNow();
-    if ((int16_t)(txEdge - now) < 2) {  // too late for a match at its time
+    int16_t slack = (int16_t)(txEdge - now);
+    uint8_t lateBy = 0;
+    if (slack < 2) {                    // too late for a match at its time
       if (frame >= 0x400) {             // a start bit: start the byte later instead
-        txEdge = now + 2;
+        txEdge = now + 2;               // (the whole byte moves: nothing is stretched)
         txEdgeFrac = 0;
       } else {
         COUNT(forcedEdges);
         txFlags |= TX_MOVED;
+        lateBy = (uint8_t)(2 - slack);  // this one stretches the bit before it
       }
       // Make the edge 2 ticks from now. (Forcing a match with FOC1A right
       // after changing COM1A made no edge: the output kept its level.)
@@ -426,6 +446,17 @@ extern "C" __attribute__((used)) uint8_t txSchedule(uint8_t edgeMade)
     }
     TIFR = _BV(OCF1A);  // an old match would call the handler early
     sei();
+#if STATS
+    // Outside the critical section on purpose: how late an edge is decides
+    // whether the other end still reads the bit, and counting must not make
+    // it later.
+    if (lateBy) {
+      if (lateBy > stats.worstLate)
+        stats.worstLate = lateBy;
+      if (lateBy > (bitTicks >> 2))
+        COUNT(veryLate);
+    }
+#endif
     return _BV(OCIE1A);
   }
 }
@@ -591,6 +622,8 @@ static void printStats()
   writeHex('z', stats.gaveUp);
   writeHex('r', stats.rxOverflows);
   writeHex('w', stats.holds);
+  writeHex('v', stats.veryLate);
+  writeHex('L', stats.worstLate);
   writeHex('P', framePeriod);  // USB frame in 1/16 Timer1 ticks: 4125 with an exact 16.5 MHz clock
   writeHex('c', stats.usbCrc);
 #if WIDE_STATS
