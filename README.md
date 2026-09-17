@@ -114,8 +114,9 @@ Two settings at the top of `TinyBridge.ino`:
   [Flow control](#flow-control)), 10 bytes of flash. Off unless you wire it,
   and it needs the reset pin given up first.
 
-With the defaults the sketch uses 6556 of the 6650 bytes available; without
-the counters, 5834; with both flow control lines, 6586. (Four of those bytes are DigiCDCFast's transaction-end
+With the defaults the sketch uses 6494 of the 6650 bytes available and 296
+of the 512 bytes of RAM; without the counters, 5768 and 271; with both flow
+control lines, 6502 and 296; with `WIDE_STATS`, 6554 and 300. (Four of those bytes are DigiCDCFast's transaction-end
 hook, which this sketch does not use; `USB_CFG_TRANSACTION_END_HOOK` in the
 library's `usbconfig.h` removes it. Measured with it either way, the bridge
 behaves identically: same throughput, no corruption, the same counters.)
@@ -276,14 +277,15 @@ stops while PB5 is high; `loop()` starts the transmitter again when it goes
 low. Told to wait by an FT232R's RTS driven by hand, the bridge sent 0 bytes,
 and then all 200 of them in order and intact once let go (`cts_test.py`).
 
-**It leaves the sketch with no room to spare, though.** The ATtiny85 build
+**It leaves the sketch little room to spare, though.** The ATtiny85 build
 runs close to the edge of its RAM: the `k` counter, which reports the stack
 bytes never touched, ranges from about 20 to 140 between runs with everything
-else equal, and with `CTS_INPUT` on it was seen at 0 -- the stack reaching the
-first byte past the globals, without yet passing it. No test lost or
-corrupted anything at 9600 bps because of it, but this is not much of a
-margin to spend. Building with `STATS` at 0 gives back 722 bytes of flash and
-25 of RAM, at the price of the counters that would tell you.
+else equal -- one reading says nothing -- and with `CTS_INPUT` on it has been
+seen at 0, the stack reaching the first byte past the globals without yet
+passing it. No test lost or corrupted anything at 9600 bps because of it.
+The flags the sketch used to keep in bytes now live in the bits of GPIOR0,
+which gave back 6 bytes of RAM and 62 of flash; `STATS` at 0 gives back
+another 25 and 726, at the price of the counters that would tell you.
 
 Nothing needs to be told to the host, and CDC has no way to tell it: the
 `SERIAL_STATE` notification carries carrier, ring, break, framing, parity and

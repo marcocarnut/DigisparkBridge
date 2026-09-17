@@ -93,16 +93,22 @@ static uint8_t rxHead, rxTail;
 static uint8_t txBuf[TX_SIZE];
 static uint8_t txHead;                 // written by loop()
 static volatile uint8_t txTail;        // written by the handler
-static volatile bool txActive;         // an edge is scheduled
-static bool txIdle;                    // the bit on the line is idle line after a stop bit
+// Flags live in the bits of GPIOR0 rather than in bytes of RAM, which this
+// sketch has less of than it would like. GPIOR0 is in the bit-addressable I/O
+// range, so each is set or cleared in a single instruction that no interrupt
+// can land inside -- which is what the ones shared with the handlers need.
+#define txFlags    GPIOR0
+#define TX_ACTIVE  _BV(0)  // an edge is scheduled
+#define TX_IDLE    _BV(1)  // the bit on the line is idle line after a stop bit
+#define TX_MOVED   _BV(2)  // the edge just made was moved later
+#define TX_HOLD    _BV(3)  // loop() has asked the transmitter to hold
+#define TX_HELD    _BV(4)  // ... and it has, between bytes
+#define SHARE_USB  _BV(5)  // bits short enough for USB data to the host to corrupt them
 // Time sharing: USB data to the host (IN packets) never goes out while a
 // byte is being transmitted. loop() asks the transmitter to hold (txHold);
 // it finishes the byte on the line and sends idle bits (txHeld) while
 // received bytes go to the host, then loop() lets it go on.
-#if TIME_SHARING
-static volatile bool txHold, txHeld;
-static bool shareUsb;                  // bits short enough for USB data to the host to corrupt them (9600 bps and up)
-#endif
+
 static uint16_t txIdleBits;            // idle bits since the last byte
 #define LINGER_BITS 10000              // how long the handler keeps running after the last byte (~1 s at 9600 bps)
 static uint16_t txFrame;               // bit 0: the bit on the line, then the rest of the byte
@@ -147,7 +153,6 @@ static uint16_t lastEnd;               // when the latest activity seen ended
 static uint16_t framePeriod = 16500 / 4;  // USB frame period, 1/16 ticks
 static uint8_t probeBits;
 static uint8_t bandBefore;             // activity starting this soon before an edge holds its handler too long
-static bool txMoved;                   // the edge just made was moved later
 
 #define COM1A_MASK (_BV(COM1A1) | _BV(COM1A0))
 #define COM1A_SET  (_BV(COM1A1) | _BV(COM1A0))
@@ -358,9 +363,9 @@ extern "C" __attribute__((used)) uint8_t txSchedule(uint8_t edgeMade)
     uint16_t now = ticksNow();
     sei();
     int16_t late = now - txEdge;
-    if (!txMoved && late >= SEEN_TICKS && late < 128)
+    if (!(txFlags & TX_MOVED) && late >= SEEN_TICKS && late < 128)
       activitySeen(now, late);
-    txMoved = false;
+    txFlags &= ~TX_MOVED;
   }
   for (;;) {
     uint16_t frame = txFrame >> 1;  // bit 0: the bit that starts at the next edge
@@ -369,29 +374,29 @@ extern "C" __attribute__((used)) uint8_t txSchedule(uint8_t edgeMade)
 #if TIME_SHARING
       // Between bytes, so loop() can send received ones to the host: say so
       // whether or not a byte is waiting, or it would wait for the timeout
-      if (txHold) {
-        txHeld = true;
+      if (txFlags & TX_HOLD) {
+        txFlags |= TX_HELD;
         frame = 3;                  // an idle bit
-        txIdle = true;
+        txFlags |= TX_IDLE;
       } else
 #endif
       if (txTail != txHead && maySend()) {
         frame = 0x600 | (txBuf[txTail] << 1);  // start bit, 8 data bits, stop bit, end marker
         if (txPlan(frame)) {
           txTail = (txTail + 1) & (TX_SIZE - 1);
-          txIdle = false;
+          txFlags &= ~TX_IDLE;
         } else {
           frame = 3;                // an idle bit
-          txIdle = true;
+          txFlags |= TX_IDLE;
         }
-      } else if (!txIdle) {
+      } else if (!(txFlags & TX_IDLE)) {
         frame = 3;                  // a bit of idle line, so the stop bit ends before a later start
-        txIdle = true;
+        txFlags |= TX_IDLE;
         txIdleBits = 0;
       } else if (++txIdleBits < LINGER_BITS) {
         frame = 3;                  // keep running on idle bits, watching USB activity for the next burst
       } else {
-        txActive = false;
+        txFlags &= ~TX_ACTIVE;
         return 0;
       }
     }
@@ -410,7 +415,7 @@ extern "C" __attribute__((used)) uint8_t txSchedule(uint8_t edgeMade)
         txEdgeFrac = 0;
       } else {
         COUNT(forcedEdges);
-        txMoved = true;
+        txFlags |= TX_MOVED;
       }
       // Make the edge 2 ticks from now. (Forcing a match with FOC1A right
       // after changing COM1A made no edge: the output kept its level.)
@@ -434,9 +439,9 @@ ISR(TIMER1_COMPA_vect, ISR_NAKED)  // an edge was made
 
 static void txStart()
 {
-  txActive = true;
+  txFlags |= TX_ACTIVE;
   txFrame = 2;  // "a stop bit on the line": the next edge starts a byte
-  txIdle = true;
+  txFlags |= TX_IDLE;
   probeBits = PROBE_BITS;
   // The clock may have missed Timer1 overflows while idle: set it from the
   // core's count of them, so what was seen of USB activity stays usable.
@@ -463,10 +468,10 @@ static void uartBegin(const Rate *entry)  // entry: in flash
   const Rate *r = &rate;
   cli();
   TIMSK &= ~_BV(OCIE1A);  // abandon a byte being sent
-  txActive = false;
+  txFlags &= ~TX_ACTIVE;
   txHead = txTail = 0;
 #if TIME_SHARING
-  txHold = txHeld = false;
+  txFlags &= ~(TX_HOLD | TX_HELD);
 #endif
   TCCR1 = (TCCR1 & ~COM1A_MASK) | COM1A_SET;
   GTCCR |= _BV(FOC1A);    // idle line
@@ -474,7 +479,10 @@ static void uartBegin(const Rate *entry)  // entry: in flash
   bitTicks = bitCycles >> 6;
   bitFrac = bitCycles & 63;
 #if TIME_SHARING
-  shareUsb = bitTicks < 40;
+  if (bitTicks < 40)
+    txFlags |= SHARE_USB;
+  else
+    txFlags &= ~SHARE_USB;
 #endif
   uint8_t ticks = 0;
   uint16_t frac = 0;  // bitFrac * k / 64 < 9, but k * bitFrac needs 16 bits
@@ -687,29 +695,27 @@ void loop()
     PORTB &= ~_BV(PB2);
 #endif
   bool sending = txHead != txTail;  // (a byte is on the line, or will be)
-  if (txHold) {
-    if (txHeld || !txActive || txHead == txTail) {
+  if (txFlags & TX_HOLD) {
+    if ((txFlags & TX_HELD) || !(txFlags & TX_ACTIVE) || txHead == txTail) {
       for (int room = SerialUSB.availableForWrite(); room > 0 && rxTail != rxHead; room--) {
         SerialUSB.write(rxBuf[rxTail]);
         rxTail = (rxTail + 1) & (RX_SIZE - 1);
       }
       if (rxTail == rxHead && SerialUSB.availableForWrite() == pgm_read_byte(&digiCdcBufferSizes[0])
           && usbInterruptIsReady()) {  // all taken by the host: transmit again
-        txHeld = false;
-        txHold = false;
+        txFlags &= ~(TX_HOLD | TX_HELD);
         holdSince = millis() - 100;
       }
     }
-    if (txHold && (uint16_t)millis() - holdSince >= 100) {  // the host isn't taking data: don't stop transmitting for it
-      txHeld = false;
-      txHold = false;
+    if ((txFlags & TX_HOLD) && (uint16_t)millis() - holdSince >= 100) {  // the host isn't taking data: don't stop transmitting for it
+      txFlags &= ~(TX_HOLD | TX_HELD);
       holdSince = millis();  // and don't hold again for 100 ms
     }
-  } else if (rxCount && sending && shareUsb && (uint16_t)millis() - holdSince >= 100) {
+  } else if (rxCount && sending && (txFlags & SHARE_USB) && (uint16_t)millis() - holdSince >= 100) {
     if (rxCount >= RX_HOLD_BYTES || (uint16_t)millis() - rxSince >= RX_HOLD_MS) {
       COUNT(holds);
       holdSince = millis();
-      txHold = true;
+      txFlags |= TX_HOLD;
     }
   } else if (rxCount >= 8 || (rxCount && (uint16_t)millis() - rxSince >= 4))
     for (int room = SerialUSB.availableForWrite(); room > 0 && rxTail != rxHead; room--) {
@@ -742,7 +748,7 @@ void loop()
   }
   // While the other device says wait, the transmitter runs out its idle bits
   // and stops; this is what picks it up again once the line goes low.
-  if (!txActive && txHead != txTail && maySend()) {
+  if (!(txFlags & TX_ACTIVE) && txHead != txTail && maySend()) {
     cli();
     txStart();
   }
