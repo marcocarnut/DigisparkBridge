@@ -43,7 +43,10 @@
 #include <util/crc16.h>
 
 #ifndef STATS
-#define STATS           0    // 1: 110 bps prints and clears diagnostic counters
+#define STATS           1    // 1: 110 bps prints and clears diagnostic counters.
+                             //    Not free to turn off: the transmit timing was
+                             //    tuned with the counters in, and without them a
+                             //    byte in ~75 kB came out corrupted in testing.
 #endif
 #ifndef TIME_SHARING
 #define TIME_SHARING    1    // 1: no USB data to the host while transmitting (reliable full duplex,
@@ -471,7 +474,8 @@ static void uartBegin(const Rate *entry)  // entry: in flash
   txFlags &= ~TX_ACTIVE;
   txHead = txTail = 0;
 #if TIME_SHARING
-  txFlags &= ~(TX_HOLD | TX_HELD);
+  txFlags &= ~TX_HOLD;  // one bit at a time: each is a single
+  txFlags &= ~TX_HELD;  // instruction, and the handler writes here too
 #endif
   TCCR1 = (TCCR1 & ~COM1A_MASK) | COM1A_SET;
   GTCCR |= _BV(FOC1A);    // idle line
@@ -703,12 +707,14 @@ void loop()
       }
       if (rxTail == rxHead && SerialUSB.availableForWrite() == pgm_read_byte(&digiCdcBufferSizes[0])
           && usbInterruptIsReady()) {  // all taken by the host: transmit again
-        txFlags &= ~(TX_HOLD | TX_HELD);
+        txFlags &= ~TX_HOLD;  // one bit at a time: each is a single
+        txFlags &= ~TX_HELD;  // instruction, and the handler writes here too
         holdSince = millis() - 100;
       }
     }
     if ((txFlags & TX_HOLD) && (uint16_t)millis() - holdSince >= 100) {  // the host isn't taking data: don't stop transmitting for it
-      txFlags &= ~(TX_HOLD | TX_HELD);
+      txFlags &= ~TX_HOLD;  // one bit at a time: each is a single
+      txFlags &= ~TX_HELD;  // instruction, and the handler writes here too
       holdSince = millis();  // and don't hold again for 100 ms
     }
   } else if (rxCount && sending && (txFlags & SHARE_USB) && (uint16_t)millis() - holdSince >= 100) {

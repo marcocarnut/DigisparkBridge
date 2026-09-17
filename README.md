@@ -103,10 +103,13 @@ Four settings at the top of `TinyBridge.ino`:
   reliable full duplex at 9600 bps (see
   [Time sharing](#time-sharing-both-directions-at-once)). 0 is faster and
   corrupts a byte now and then, and saves 350 bytes of flash.
-- `STATS` (0): the diagnostic counters and the 110 bps command that prints
+- `STATS` (1): the diagnostic counters and the 110 bps command that prints
   them (see [Diagnostics](#diagnostics)). They cost 726 bytes of flash and 25
-  of RAM, and this sketch has been measured with none of either to spare, so
-  they are off unless you are measuring something. With `WIDE_STATS` (0) the
+  of RAM, which this sketch can ill afford -- but turning them off is not
+  free either. The transmitter's timing was tuned with them compiled in, and
+  without them three runs of 50 kB in both directions corrupted two bytes,
+  where the same code with them corrupted none. They stay on until the
+  planner is retuned without them. With `WIDE_STATS` (0) the
   byte counters are 32-bit, printed as two halves (`N`/`n`, `B`/`b`), at 60
   bytes of flash: they wrap at 65535 otherwise.
 - `RTS_OUTPUT` (0): PB2 as an RTS output (see
@@ -119,10 +122,10 @@ Four settings at the top of `TinyBridge.ino`:
   driving PB5, the pull-up reads "wait" and the bridge never sends a byte --
   it still receives, so the link looks half dead rather than broken.
 
-With the defaults the sketch uses 5768 of the 6650 bytes available and 271 of
-the 512 bytes of RAM; with the counters, 6494 and 296; with the counters and
-both flow control lines, 6502 and 296; with `WIDE_STATS` as well, 6554 and
-300. (Four of those bytes are DigiCDCFast's transaction-end
+With the defaults the sketch uses 6488 of the 6650 bytes available and 296 of
+the 512 bytes of RAM; with both flow control lines, 6496; with `WIDE_STATS`,
+6548 and 300; without the counters, 5762 and 271 -- and see what that costs,
+above. (Four of those bytes are DigiCDCFast's transaction-end
 hook, which this sketch does not use; `USB_CFG_TRANSACTION_END_HOOK` in the
 library's `usbconfig.h` removes it. Measured with it either way, the bridge
 behaves identically: same throughput, no corruption, the same counters.)
@@ -214,12 +217,11 @@ unless noted; throughput per direction:
 | 9600 (20 kB) | 0, 961 B/s | 0, 859 B/s | 0 / 0, 601 B/s | receive 0; transmit 2, 858 B/s |
 | 9600 (50 kB, 3 runs) | | | 0 / 0, 600 B/s | receive 0; transmit 8, 10, 14; 859 B/s |
 
-Later, with the shipping defaults (counters off) against an FT232R, five
-rounds of 20 kB each way at 9600 bps: every test passed but one, which
-corrupted a single transmitted byte -- about one in 100 kB. Nothing was ever
-lost. The counters cost RAM this sketch measurably needs, which is why they
-are off, but it also means a build with them on is not quite the build you
-ship: this one is close to the edge either way.
+Later, against an FT232R, three rounds of 50 kB in both directions at once
+with the shipping defaults: nothing lost, nothing corrupted. The same rounds
+with `STATS` at 0 corrupted two transmitted bytes, which is how we learned
+that the counters are part of what the transmitter's timing was tuned
+around.
 | 19200 (10 kB) | 0, 1921 B/s | 15, 1293 B/s | receive 846 lost, 1271 corrupted; transmit 35 | receive 465 lost, 489 corrupted; transmit 221 |
 
 Below 9600 bps time sharing does nothing: the bits are long enough that USB
@@ -396,9 +398,8 @@ Things tried along the way:
 
 ## Diagnostics
 
-With `STATS` set to 1 at the top of the sketch (it ships at 0, since the
-counters cost RAM the sketch has little of), setting the port to 110 bps
-makes it print a line of hex counters and clear them:
+Setting the port to 110 bps makes the sketch print a line of hex counters
+and clear them:
 
 - `n` bytes received, `g` sample windows lost, `o` capture queue overflows,
   `f` framing errors;
