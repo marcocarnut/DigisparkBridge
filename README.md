@@ -258,10 +258,12 @@ runs with a reboot before each, fourteen were perfectly clean and the other
 six corrupted **exactly one byte**, where before a single run could corrupt
 eleven. Receiving stayed perfect: 0 in 492 kB.
 
-Over a real PPP link carrying two 400 kB file transfers at once, with both
-hooks on: **1.12 MB received without a single error**, and 41 damaged frames
-in 7281 sent, which is 0.56% of frames or about 4.3 corrupted bytes per
-100 kB. Before the hooks the same test damaged about 34 frames per 100 kB.
+Over real PPP links carrying two 400 kB file transfers at once, four runs
+totalling **3.4 MB out and about 4 MB back**: 91 damaged frames, which is
+**2.7 corrupted bytes per 100 kB**, and one single error in everything
+received. The four runs measured 1.3, 3.1, 4.3 and 4.4 per 100 kB, which is
+the spread to expect rather than noise around a fourth decimal. Before the
+hook the same test damaged about 34 frames per 100 kB.
 
 Anyone measuring this should know that one run tells you nothing. The same
 firmware gave 6.0 and 446.7 corrupted per 100 kB in two consecutive sets of
