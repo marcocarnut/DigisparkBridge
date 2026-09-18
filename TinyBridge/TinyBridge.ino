@@ -27,10 +27,15 @@
   point of the frame. With DigiCDCFast's usual 8-byte packets each takes
   ~110 us, longer than the deadline; built for 2-byte packets (below), ~73 us.
   A transaction starting just before an edge, or while its handler runs, can
-  still hold the handler past the next edge. So each byte is planned: the
-  handler's late runs show when the transactions start, and a byte starts
-  later (or after an idle bit) when one would begin near an edge whose next
-  edge changes the level. Bytes go out between the host's transactions.
+  still hold the handler past the next edge, and a run of back-to-back
+  transactions can hold it for the length of several. Two things answer that.
+  Each byte is planned: the handler's late runs show when the transactions
+  start, and a byte starts later (or after an idle bit) when one would begin
+  near an edge whose next edge changes the level, so bytes go out between the
+  host's transactions. And the edges get made while the driver has the
+  processor, from DigiCDCFast's usbTransactionEnd(), which it calls at the end
+  of every transaction (CALL_HOOK below): planning cannot help an edge that
+  came due during a blackout, because nothing of ours is running then.
 
   Latest measurements of V-USB delaying other interrupts: up to ~200 us.
 */
@@ -51,7 +56,27 @@ const uchar digiCdcConfigDescriptor[DIGICDC_DESCRIPTOR_SIZE] PROGMEM =
     DIGICDC_CONFIG_DESCRIPTOR(USB_PACKET_SIZE, USB_PACKET_SIZE);
 DIGICDC_BUFFERS(8, 8);
 #endif
-#include <util/crc16.h>
+
+// The hook assumes no transaction outlasts a bit time, so that
+// the compare it writes is always still in the future. That holds for 2-byte
+// data packets (a transaction is at most about 19 ticks against 27 for a bit
+// at 9600 bps) and not for 8-byte ones, where the compare would land in the
+// past and nothing would fire until the timer wrapped, about a millisecond of
+// the wrong level on the line. Fail the build rather than leave that to be
+// discovered.
+#ifndef CALL_HOOK
+#define CALL_HOOK       1    // 1: make the transmitter's bit edges, and collect
+#endif                       //    USI's samples, from inside DigiCDCFast's
+                             //    usbTransactionEnd() -- the one thing that can
+                             //    run while the USB driver holds the processor.
+                             //    Worth about five times fewer forced edges; 0
+                             //    to build without it.
+#if CALL_HOOK && USB_PACKET_SIZE > 2
+#error "CALL_HOOK needs USB_PACKET_SIZE 2: see the comment above"
+#endif
+#if CALL_HOOK && !USB_CFG_TRANSACTION_END_HOOK
+#error "CALL_HOOK needs USB_CFG_TRANSACTION_END_HOOK in DigiCDCFast's usbconfig.h"
+#endif
 
 #ifndef STATS
 #define STATS           1    // 1: 110 bps prints and clears diagnostic counters.
@@ -76,21 +101,39 @@ DIGICDC_BUFFERS(8, 8);
 #ifndef RX_HOLD_MS
 #define RX_HOLD_MS      20   // or the oldest is this old
 #endif
-#ifndef AB_TEST
-#define AB_TEST         0    // 1: 150 and 200 bps switch the two thresholds
-#endif                       //    between 20/20 and 8/8, to compare them in
-#if AB_TEST                  //    one binary, interleaved, without reflashing
-static uint8_t holdBytes = RX_HOLD_BYTES, holdMs = RX_HOLD_MS;
-#define HOLD_BYTES holdBytes
-#define HOLD_MS    holdMs
-#define AB_SLOW    150
-#define AB_FAST    200
-#else
 #define HOLD_BYTES RX_HOLD_BYTES
 #define HOLD_MS    RX_HOLD_MS
-#endif
 #else
 #define RX_SIZE         16   // powers of 2
+#endif
+
+// The shape of a byte on the line, and none of it specific to time sharing.
+#ifndef AB_TEST
+#define AB_TEST         0    // 1: 150 and 200 bps switch one stop bit and two,
+#endif                       //    so the two can be interleaved run by run
+#ifndef STOP_BITS
+#define STOP_BITS       1    // 2: a second stop bit, a tenth of the transmit
+#endif                       //    rate spent giving the far end an idle bit to
+                             //    resynchronise on (measured: no effect)
+#ifndef SPAN_STATS
+#define SPAN_STATS      0    // 1: measure how long each byte takes on the line
+#endif                       //    (D, x), in place of the CRC counters (c, b)
+#define FRAME_1STOP     0x600  // start bit, 8 data bits, stop bit, end marker
+#define FRAME_2STOP     0xE00  // ... and a second stop bit
+#define STARTS_1STOP    0x400  // the frame's value while its start bit is next
+#define STARTS_2STOP    0x800
+#if AB_TEST
+static bool hookArmed = true;  // 150 bps leaves the driver unarmed, 200 arms it
+#define AB_SLOW    150
+#define AB_FAST    200
+#define FRAME_OF(b)     (FRAME_1STOP | ((b) << 1))
+#define FRAME_STARTS    STARTS_1STOP
+#elif STOP_BITS == 2
+#define FRAME_OF(b)     (FRAME_2STOP | ((b) << 1))
+#define FRAME_STARTS    STARTS_2STOP
+#else
+#define FRAME_OF(b)     (FRAME_1STOP | ((b) << 1))
+#define FRAME_STARTS    STARTS_1STOP
 #endif
 #define TX_SIZE         16
 
@@ -128,6 +171,33 @@ static volatile uint8_t txTail;        // written by the handler
 // sketch has less of than it would like. GPIOR0 is in the bit-addressable I/O
 // range, so each is set or cleared in a single instruction that no interrupt
 // can land inside -- which is what the ones shared with the handlers need.
+// The driver makes edges of its own from these while it holds the processor:
+// the rest of the byte (usbEdgeFrame, the handler's own frame), the compare
+// output bits without the level (usbEdgeTccr), a bit time in ticks and in
+// 256ths of a tick (usbEdgeBit, usbEdgeBitFrac) with the running fraction the
+// handler shares (usbEdgeFrac), and how many edges it has made since the
+// handler last looked (usbEdgeSteps). EDGE_READY (below) says they are worth
+// using: the handler clears it before it looks at them and while it programs,
+// so the driver can never be moving the compare at the same time, and the
+// driver clears it itself at the end of a byte, which wants planning.
+extern "C" {
+  // used: nothing in C reads some of these -- only the driver's assembler, or
+  // this sketch's own, does -- and the linker discards what it cannot see read
+  uint16_t usbEdgeFrame __attribute__((used));
+  uint8_t usbEdgeTccr __attribute__((used)), usbEdgeBit __attribute__((used)),
+          usbEdgeBitFrac __attribute__((used)), usbEdgeFrac __attribute__((used)),
+          usbEdgeSteps __attribute__((used));
+}
+#define txFrame usbEdgeFrame
+#define txEdgeFrac usbEdgeFrac
+// The hook leaves a window of USI's samples here:
+// it takes one only when USI_STASH is clear, and sets it; rxCapture() empties
+// the stash and clears the bit again. Taking a window also clears USIOIF, so
+// the overflow interrupt does not run for it at all -- which is most of what
+// the hook is worth, since that interrupt is what delays the transmitter.
+extern "C" { uint8_t usbUsiSamples __attribute__((used)),
+                     usbUsiCount __attribute__((used)); }
+
 #define txFlags    GPIOR0
 #define TX_ACTIVE  _BV(0)  // an edge is scheduled
 #define TX_IDLE    _BV(1)  // the bit on the line is idle line after a stop bit
@@ -135,6 +205,8 @@ static volatile uint8_t txTail;        // written by the handler
 #define TX_HOLD    _BV(3)  // loop() has asked the transmitter to hold
 #define TX_HELD    _BV(4)  // ... and it has, between bytes
 #define SHARE_USB  _BV(5)  // bits short enough for USB data to the host to corrupt them
+#define USI_STASH  _BV(7)  // usbUsiSamples/usbUsiCount hold a window the driver took
+#define EDGE_READY _BV(6)  // the driver may make the rest of the byte's edges
 // Time sharing: USB data to the host (IN packets) never goes out while a
 // byte is being transmitted. loop() asks the transmitter to hold (txHold);
 // it finishes the byte on the line and sends idle bits (txHeld) while
@@ -142,11 +214,9 @@ static volatile uint8_t txTail;        // written by the handler
 
 static uint16_t txIdleBits;            // idle bits since the last byte
 #define LINGER_BITS 10000              // how long the handler keeps running after the last byte (~1 s at 9600 bps)
-static uint16_t txFrame;               // bit 0: the bit on the line, then the rest of the byte
 static uint16_t txEdge;                // when the next edge is due
-static uint8_t txEdgeFrac;             // and its 1/64 ticks
 static uint16_t bitCycles;
-static uint8_t bitTicks, bitFrac;      // bitCycles in ticks and 1/64 ticks
+static uint8_t bitTicks, bitFrac;      // bitCycles in ticks and 256ths of a tick
 static uint8_t edgeTicks[10];          // edge k of a byte, ticks after its start edge
 
 // USB activity: the host's transactions come every millisecond, and V-USB
@@ -200,11 +270,34 @@ static uint8_t bandBefore;             // activity starting this soon before an 
                          //    two words, the low one first (n N and b B)
 #endif
 #if WIDE_STATS
+#define N_TAGS "nN"
+#define B_TAGS "bB"
+#else
+#define N_TAGS "n"
+#define B_TAGS "b"
+#endif
+#if SPAN_STATS
+#define SPAN_TAGS "Dx"
+#else
+#define SPAN_TAGS ""
+#endif
+#ifndef CRC_STATS
+#define CRC_STATS 0      // 1: c and b, the bridge's own CRC and count of the
+#endif                   //    bytes read from USB, to compare with what the
+                         //    host sent. They answered one question -- whether
+                         //    USB itself corrupts anything, which it does not
+                         //    -- and cost 90 bytes of flash to keep asking.
+#if CRC_STATS
+#include <util/crc16.h>
+#define CRC_TAGS "c" B_TAGS
+#else
+#define CRC_TAGS ""
+#endif
+#define COUNTER_TAGS "kP" N_TAGS "gofeahpzrwH" SPAN_TAGS CRC_TAGS
+#if WIDE_STATS
 #define COUNTER uint32_t
-#define COUNTER_TAGS "kPnNgofeahpzrwvLcbB"
 #else
 #define COUNTER uint16_t
-#define COUNTER_TAGS "kPngofeahpzrwvLcb"
 #endif
 #define COUNT(counter) (stats.c.counter++)
 struct Counters {
@@ -215,18 +308,23 @@ struct Counters {
   uint8_t captureOverflows;    // o: updated by the receive handler
   uint8_t spare1;              //    (the filler that keeps the slots words)
   uint16_t framingErrors;      // f
-  uint16_t forcedEdges;        // e: this one and the next four, by the transmitter
+  uint16_t forcedEdges;        // e: this one and the next five, by the transmitter
   uint16_t seen;               // a
   uint16_t shifted;            // h
   uint16_t probed;             // p
   uint16_t gaveUp;             // z
   uint16_t rxOverflows;        // r
   uint16_t holds;              // w
-  uint16_t veryLate;           // v: edges late by more than a quarter bit
-  uint8_t worstLate;           // L: and the worst of them, in ticks
+  uint16_t hooked;             // H: edges the USB interrupt loaded
+#if SPAN_STATS
+  uint8_t worstShift;          // D: furthest an edge inside a byte was moved,
   uint8_t spare2;              //    (filler)
+  uint16_t badBits;            // x: and how many moved by a whole bit or more,
+#endif                         //    which must misread
+#if CRC_STATS
   uint16_t usbCrc;             // c: CRC-XMODEM of the bytes read from USB
   COUNTER usbBytes;            // b
+#endif
 };
 static union {
   struct Counters c;
@@ -236,6 +334,94 @@ static_assert(sizeof COUNTER_TAGS - 1 == sizeof stats.word / sizeof stats.word[0
               "COUNTER_TAGS needs one letter per counter word");
 #else
 #define COUNT(counter) ((void)0)
+#endif
+
+// Both time-critical jobs, done in the weak hook DigiCDCFast has called since
+// 1.3.0, so the library needs no changes at all. The alternative -- inlining
+// the same instructions into the driver -- was tried and measured
+// indistinguishable: it has to sit past the driver's cycle-counted branches
+// and jump there and back, 8 cycles against the 7 of rcall and ret.
+#if CALL_HOOK
+extern "C" void usbTransactionEnd() __attribute__((naked, used));
+void usbTransactionEnd()
+{
+  asm volatile(
+      // USI first: it has the tighter deadline, and samples missed are gone
+      "in    r16, %[usisr]        \n"
+      "sbrs  r16, %[usioif]       \n"   // no window waiting
+      "rjmp  1f                   \n"
+      "sbic  %[gpior], 7          \n"   // the stash still holds the last one
+      "rjmp  1f                   \n"
+      "in    r17, %[tcnt0]        \n"   // keep clear of the compare match,
+      "tst   r17                  \n"   // where a sample shifts in
+      "breq  1f                   \n"
+      "in    r20, %[ocr0a]        \n"
+      "sub   r20, r17             \n"
+      "cpi   r20, 3               \n"
+      "brlo  1f                   \n"
+      "in    r17, %[usibr]        \n"
+      "sts   usbUsiSamples, r17   \n"
+      "andi  r16, 0x0F            \n"
+      "sts   usbUsiCount, r16     \n"
+      "subi  r16, -8              \n"   // next overflow 8 samples on
+      "andi  r16, 0x0F            \n"
+      "ori   r16, %[usioifm]      \n"
+      "out   %[usisr], r16        \n"
+      "sbi   %[gpior], 7          \n"
+      "1:                         \n"
+      // then the next bit edge, and the rest of the byte if they keep coming
+      "sbis  %[gpior], 6          \n"
+      "ret                        \n"
+      "in    r16, %[tifr]         \n"
+      "sbrs  r16, %[ocf1a]        \n"   // the timer's own edge has not happened
+      "ret                        \n"
+      "lds   r16, usbEdgeFrame    \n"
+      "lds   r17, usbEdgeFrame+1  \n"
+      "cpi   r16, 4               \n"   // stop before the edge ending the byte
+      "brsh  2f                   \n"
+      "tst   r17                  \n"
+      "brne  2f                   \n"
+      "cbi   %[gpior], 6          \n"
+      "ret                        \n"
+      "2:                         \n"
+      "lsr   r17                  \n"
+      "ror   r16                  \n"
+      "sts   usbEdgeFrame, r16    \n"
+      "sts   usbEdgeFrame+1, r17  \n"
+      "lds   r17, usbEdgeTccr     \n"
+      "ori   r17, %[edgeclr]      \n"
+      "sbrc  r16, 0               \n"
+      "ori   r17, %[edgeset]      \n"
+      "out   %[tccr1], r17        \n"
+      "lds   r16, usbEdgeFrac     \n"   // carry the fraction of a bit time:
+      "lds   r17, usbEdgeBitFrac  \n"   // sts, in and lds leave the carry
+      "add   r16, r17             \n"   // alone, so it reaches the adc below
+      "sts   usbEdgeFrac, r16     \n"
+      "in    r17, %[ocr1a]        \n"
+      "lds   r16, usbEdgeBit      \n"
+      "adc   r17, r16             \n"
+      "out   %[ocr1a], r17        \n"
+      "ldi   r16, %[ocf1am]       \n"
+      "out   %[tifr], r16         \n"   // the handler is wanted at that edge
+      "lds   r16, usbEdgeSteps    \n"   // which it counts, to catch its clock up
+      "inc   r16                  \n"
+      "sts   usbEdgeSteps, r16    \n"
+      "ret                        \n"
+      :: [usisr]   "I"(_SFR_IO_ADDR(USISR)),
+         [usibr]   "I"(_SFR_IO_ADDR(USIBR)),
+         [gpior]   "I"(_SFR_IO_ADDR(GPIOR0)),
+         [tcnt0]   "I"(_SFR_IO_ADDR(TCNT0)),
+         [ocr0a]   "I"(_SFR_IO_ADDR(OCR0A)),
+         [tifr]    "I"(_SFR_IO_ADDR(TIFR)),
+         [tccr1]   "I"(_SFR_IO_ADDR(TCCR1)),
+         [ocr1a]   "I"(_SFR_IO_ADDR(OCR1A)),
+         [usioif]  "I"(USIOIF),
+         [usioifm] "M"(_BV(USIOIF)),
+         [ocf1a]   "I"(OCF1A),
+         [ocf1am]  "M"(_BV(OCF1A)),
+         [edgeclr] "M"(COM1A_CLR),
+         [edgeset] "M"(COM1A_SET));
+}
 #endif
 
 // Timer1 ticks, counted on from the last call: call at least every 256 ticks
@@ -254,33 +440,55 @@ static uint16_t ticksNow()
 extern "C" void rxCapture() __attribute__((used));
 void rxCapture()
 {
-  // A sample shifting in between reading and rewriting the counter would be
-  // lost. It shifts at the compare match, when TCNT0 goes from OCR0A to 0,
-  // but USI's counter changes slightly later: with only TCNT0 == OCR0A-1
-  // avoided, about 1 byte in 5000 was lost or corrupted at 9600 bps. Keep
-  // clear of the ticks on both sides of the match.
-  cli();
-  for (uint8_t t; (t = TCNT0) == 0 || (uint8_t)(OCR0A - t) <= 1; )
-    ;
-  uint8_t count = USISR & 0x0F;  // samples since the overflow
-  USISR = _BV(USIOIF) | ((8 + count) & 0x0F);  // next overflow 8 samples after it
-  uint8_t samples = USIBR;
-  sei();
-
   static bool lost;
-  uint8_t slot = captureHead, bit = 1 << (slot & 7);
-  captured[slot] = samples;
-  if (count >= 8 || lost) {  // too late: a window is lost
-    if (slot & 8) GPIOR2 |= bit; else GPIOR1 |= bit;
-  } else {
-    if (slot & 8) GPIOR2 &= ~bit; else GPIOR1 &= ~bit;
+  // The driver's USI hook may have taken a window already, and may have taken
+  // one this handler was never woken for: taking a window clears USIOIF, so
+  // the overflow interrupt does not run for it. Empty the stash first, then
+  // the live window if there is one; the bookkeeping below is the same
+  // whichever a window came from.
+  for (;;) {
+    uint8_t count, samples;
+    // With interrupts off for the whole choice: otherwise the hook can take
+    // the live window between the test below and the read, and this would
+    // then read a window already taken -- 11 bytes corrupted in 8000 when it
+    // could.
+    cli();
+    if (txFlags & USI_STASH) {
+      samples = usbUsiSamples;    // read the stash before clearing the bit:
+      count = usbUsiCount;        // while it is set the hook leaves it alone
+      txFlags &= ~USI_STASH;      // one bit of GPIOR0, so a single cbi
+      sei();
+    } else if (!(USISR & _BV(USIOIF))) {
+      sei();
+      break;
+    } else {
+      // A sample shifting in between reading and rewriting the counter would
+      // be lost. It shifts at the compare match, when TCNT0 goes from OCR0A
+      // to 0, but USI's counter changes slightly later: with only
+      // TCNT0 == OCR0A-1 avoided, about 1 byte in 5000 was lost or corrupted
+      // at 9600 bps. Keep clear of the ticks on both sides of the match.
+      for (uint8_t t; (t = TCNT0) == 0 || (uint8_t)(OCR0A - t) <= 1; )
+        ;
+      count = USISR & 0x0F;  // samples since the overflow
+      USISR = _BV(USIOIF) | ((8 + count) & 0x0F);  // next overflow 8 samples after it
+      samples = USIBR;
+      sei();
+    }
+
+    uint8_t slot = captureHead, bit = 1 << (slot & 7);
+    captured[slot] = samples;
+    if (count >= 8 || lost) {  // too late: a window is lost
+      if (slot & 8) GPIOR2 |= bit; else GPIOR1 |= bit;
+    } else {
+      if (slot & 8) GPIOR2 &= ~bit; else GPIOR1 &= ~bit;
+    }
+    uint8_t next = (slot + 1) & (CAPTURE_SIZE - 1);
+    lost = next == captureTail;
+    if (!lost)
+      captureHead = next;
+    else
+      COUNT(captureOverflows);
   }
-  uint8_t next = (slot + 1) & (CAPTURE_SIZE - 1);
-  lost = next == captureTail;
-  if (!lost)
-    captureHead = next;
-  else
-    COUNT(captureOverflows);
 
   USICR = _BV(USICS0) | _BV(USIOIE);
 }
@@ -318,9 +526,9 @@ ISR(USI_OVF_vect)
 
 static void txAdvance()  // txEdge one bit later
 {
-  txEdgeFrac += bitFrac;
-  txEdge += bitTicks + (txEdgeFrac >> 6);
-  txEdgeFrac &= 63;
+  uint16_t frac = txEdgeFrac + bitFrac;
+  txEdge += bitTicks + (frac >> 8);
+  txEdgeFrac = (uint8_t)frac;
 }
 
 // USB activity ended at `end`, having held the handler of an edge made `late`
@@ -422,6 +630,23 @@ extern "C" __attribute__((used)) uint8_t txSchedule(uint8_t edgeMade)
       activitySeen(now, late);
     txFlags &= ~TX_MOVED;
   }
+  // Stop the driver making edges before looking at what it made: clearing the
+  // bit is a single cbi, so there is no window where both of us are moving the
+  // compare.
+  txFlags &= ~EDGE_READY;
+  if (usbEdgeSteps) {
+    // It shifted the frame along for each edge and left the latest in OCR1A,
+    // so take that rather than redo the arithmetic: the two clocks then agree
+    // exactly, and the shared fraction carries on where it left off. An edge
+    // is at most 28 ticks and it stops within a byte, so the low byte can have
+    // wrapped once at most.
+    uint8_t low = OCR1A, was = (uint8_t)txEdge;
+    txEdge = (txEdge & 0xFF00) | low;
+    if (low < was)
+      txEdge += 0x100;
+    COUNT(hooked);
+    usbEdgeSteps = 0;
+  }
   for (;;) {
     uint16_t frame = txFrame >> 1;  // bit 0: the bit that starts at the next edge
     txAdvance();
@@ -436,7 +661,7 @@ extern "C" __attribute__((used)) uint8_t txSchedule(uint8_t edgeMade)
       } else
 #endif
       if (txTail != txHead && maySend()) {
-        frame = 0x600 | (txBuf[txTail] << 1);  // start bit, 8 data bits, stop bit, end marker
+        frame = FRAME_OF(txBuf[txTail]);  // start bit, 8 data bits, stop, end marker
         if (txPlan(frame)) {
           txTail = (txTail + 1) & (TX_SIZE - 1);
           txFlags &= ~TX_IDLE;
@@ -465,15 +690,19 @@ extern "C" __attribute__((used)) uint8_t txSchedule(uint8_t edgeMade)
     cli();
     uint16_t now = ticksNow();
     int16_t slack = (int16_t)(txEdge - now);
-    uint8_t lateBy = 0;
+#if STATS && SPAN_STATS
+    bool insideByte = false;
+#endif
     if (slack < 2) {                    // too late for a match at its time
-      if (frame >= 0x400) {             // a start bit: start the byte later instead
+      if (frame >= FRAME_STARTS) {      // a start bit: start the byte later instead
         txEdge = now + 2;               // (the whole byte moves: nothing is stretched)
         txEdgeFrac = 0;
       } else {
         COUNT(forcedEdges);
         txFlags |= TX_MOVED;
-        lateBy = (uint8_t)(2 - slack);  // this one stretches the bit before it
+#if STATS && SPAN_STATS
+        insideByte = true;  // nothing but a flag here: see below
+#endif
       }
       // Make the edge 2 ticks from now. (Forcing a match with FOC1A right
       // after changing COM1A made no edge: the output kept its level.)
@@ -481,15 +710,29 @@ extern "C" __attribute__((used)) uint8_t txSchedule(uint8_t edgeMade)
     }
     TIFR = _BV(OCF1A);  // an old match would call the handler early
     sei();
-#if STATS
-    // Outside the critical section on purpose: how late an edge is decides
-    // whether the other end still reads the bit, and counting must not make
-    // it later.
-    if (lateBy) {
-      if (lateBy > stats.c.worstLate)
-        stats.c.worstLate = lateBy;
-      if (lateBy > (bitTicks >> 2))
-        COUNT(veryLate);
+    // Let the driver make the edges after this one, if they need no planning
+    // -- which is to say anywhere inside a byte: the edge that ends one wants
+    // planning, and the driver stops there by itself.
+#if AB_TEST
+    if (hookArmed && (frame >> 1) != 1) {
+#else
+    if ((frame >> 1) != 1) {
+#endif
+      usbEdgeTccr = TCCR1 & ~COM1A_MASK;
+      txFlags |= EDGE_READY;
+    }
+#if STATS && SPAN_STATS
+    // After sei(), and after the edge has been programmed: an edge inside a
+    // byte that moves late stretches the bit before it and shortens the one
+    // after, while the byte's total length stays right -- so this has to be
+    // measured per edge, and measuring it must not delay it (counting here
+    // rather than up there is worth 400 times the corruption).
+    if (insideByte) {
+      uint8_t moved = (uint8_t)(2 - slack);
+      if (moved > stats.c.worstShift)
+        stats.c.worstShift = moved;
+      if (moved >= bitTicks)  // a whole bit: the far end samples the wrong one
+        COUNT(badBits);
     }
 #endif
     return _BV(OCIE1A);
@@ -547,7 +790,9 @@ static void uartBegin(const Rate *entry)  // entry: in flash
   GTCCR |= _BV(FOC1A);    // idle line
   bitCycles = r->bitCycles;
   bitTicks = bitCycles >> 6;
-  bitFrac = bitCycles & 63;
+  bitFrac = (bitCycles & 63) << 2;  // a tick is 64 cycles, so a cycle is 4/256
+  usbEdgeBit = bitTicks;            // the driver makes edges a bit apart too
+  usbEdgeBitFrac = bitFrac;
 #if TIME_SHARING
   if (bitTicks < 40)
     txFlags |= SHARE_USB;
@@ -555,9 +800,9 @@ static void uartBegin(const Rate *entry)  // entry: in flash
     txFlags &= ~SHARE_USB;
 #endif
   uint8_t ticks = 0;
-  uint16_t frac = 0;  // bitFrac * k / 64 < 9, but k * bitFrac needs 16 bits
+  uint16_t frac = 0;  // bitFrac * k / 256 < 9, but k * bitFrac needs 16 bits
   for (uint8_t k = 0; k < 10; k++, ticks += bitTicks, frac += bitFrac)
-    edgeTicks[k] = ticks + (frac >> 6);
+    edgeTicks[k] = ticks + (frac >> 8);
   bandBefore = WINDOW_TICKS + HANDLER_TICKS > bitTicks ? WINDOW_TICKS + HANDLER_TICKS - bitTicks : 0;
   USICR = 0;
   TCCR0B = 0;
@@ -640,6 +885,9 @@ static void printStats()
     stats.c.unused++;
   stats.c.period = framePeriod;  // USB frame in 1/16 Timer1 ticks: 4125 with an exact 16.5 MHz clock
   SerialUSB.write('S');
+#if AB_TEST
+  writeHex('F', hookArmed);  // whether the stash was armed
+#endif
   for (uint8_t i = 0; i < sizeof stats.word / sizeof stats.word[0]; i++)
     writeHex(pgm_read_byte(&tags[i]), stats.word[i]);
   SerialUSB.write('\r');
@@ -732,9 +980,8 @@ void loop()
       printStats();
 #endif
 #if AB_TEST
-    else if (baud == AB_SLOW || baud == AB_FAST) {
-      holdBytes = holdMs = baud == AB_SLOW ? RX_HOLD_BYTES : 8;
-    }
+    else if (baud == AB_SLOW || baud == AB_FAST)
+      hookArmed = baud == AB_FAST;
 #endif
     else if (baud != uartBaud)  // other rates leave the UART as it is
       for (const Rate *r = rates; r < rates + sizeof rates / sizeof *rates; r++)
@@ -822,8 +1069,12 @@ void loop()
       break;
     txBuf[txHead] = SerialUSB.read();
 #if STATS
+#if !SPAN_STATS
+#if CRC_STATS
     stats.c.usbCrc = _crc_xmodem_update(stats.c.usbCrc, txBuf[txHead]);
     stats.c.usbBytes++;
+#endif
+#endif
 #endif
     txHead = next;
   }

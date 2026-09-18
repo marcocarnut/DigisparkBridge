@@ -1,8 +1,8 @@
 # DigisparkBridge
 
 A minimalistic (8N1 only, RTS flow control) USB-to-UART bridge for the
-original Digispark (ATtiny85) and limited to 9,600 bps full duplex
-(both directions at once) by taking turns around USB traffic
+original Digispark (ATtiny85) and limited to 9,600 bps "quasi-full duplex"
+(both directions at once, almost) by taking turns around USB traffic
 (see notes below); receiving alone works up to 19,200 bps.
 Which is not too shabby for a device that has no UART
 at all: it receives with the USI peripheral, oversampling in hardware, and
@@ -10,18 +10,25 @@ transmits with bit edges timed by a timer's compare output,
 while [DigiCDCFast](https://github.com/marcocarnut/DigiCDCFast) runs
 bitbanged USB in software on the same 8-bit chip.
 
-**Is it useful?** At 1200 to 9600 bps, yes: every test passes, in either
-direction and both at once, with no lost or corrupted bytes. The price is
-throughput when both directions are busy at 9600 bps: the bridge and the
-host take turns on USB, so each way carries about 600 bytes/s instead of
-860, and received bytes can wait up to 20 ms. That is
-[time sharing](#time-sharing-both-directions-at-once), which can be turned
-off for full speed at the cost of the occasional corrupted byte
-(`TIME_SHARING` in the sketch). Above 9600 bps only receiving works.
+**Is it useful?** At 1200 to 4800 bps, yes: every test passes, in either
+direction and both at once, with no lost or corrupted bytes. At 9600 bps it
+works almost perfectly -- either direction alone is clean, and only with both
+near saturation does it corrupt a few bytes per 100 kB on the way out. The
+other price is throughput: the bridge and the host take turns on USB, so each
+direction carries about 600 bytes/s instead of 860 transmitting and 960
+receiving, and received bytes can wait up to 20 ms. That is
+[time sharing](#time-sharing-both-directions-at-once), which can be switched
+off for full speed at the cost of more corruption (`TIME_SHARING` in the
+sketch). That's why "quasi full duplex". It's pretty usable, but not perfect.
+Above 9600 bps only receiving works.
 
-For a serial port at any rate, a USB-serial chip costs less than a dollar,
+For a 9600 serial GPS, for instance, those imperfections are inconsequential;
+so, yes, it is useful -- if anything, to give those aging Digisparks a better
+meaning to their lives than sitting unused in your drawer.
+
+For a true serial port at any rate, a USB-serial chip costs less than a dollar,
 and the [DigisparkProBridge](https://github.com/marcocarnut/DigisparkProBridge)
-has a hardware UART and is lossless to 38400 bps in both directions.
+has a hardware UART and is lossless to 57600 bps in both directions.
 
 It is also a demonstration of what a fast USB serial library like
 [DigiCDCFast](https://github.com/marcocarnut/DigiCDCFast) makes
@@ -98,22 +105,25 @@ stty -F /dev/ttyACM0 134        # only if a bridge is already running
 
 ### Build options
 
-Four settings at the top of `TinyBridge.ino`:
+Settings at the top of `TinyBridge.ino`, and two in DigiCDCFast:
 
 - `TIME_SHARING` (1): hold data going to the host while transmitting, for
   reliable full duplex at 9600 bps (see
   [Time sharing](#time-sharing-both-directions-at-once)). 0 is faster and
-  corrupts a byte now and then, and saves 286 bytes of flash.
+  corrupts a byte now and then, and saves 284 bytes of flash.
 - `STATS` (1): the diagnostic counters and the 110 bps command that prints
-  them (see [Diagnostics](#diagnostics)). They cost 666 bytes of flash and 34
+  them (see [Diagnostics](#diagnostics)). They cost 510 bytes of flash and 28
   of RAM, which this sketch can ill afford -- but turning them off is not
   free either. The transmitter's timing was tuned with them compiled in, and
   without them three runs of 50 kB in both directions corrupted two bytes,
   where the same code with them corrupted none. They stay on until the
-  planner is retuned without them. With `WIDE_STATS` (0) the
-  byte counters are 32-bit, printed as two words each, the low one first
-  (`n` `N`, `b` `B`), at 20 bytes of flash and 4 of RAM: they wrap at 65535
-  otherwise.
+  planner is retuned without them. With `WIDE_STATS` (0) the byte counter is
+  32-bit, printed as two words, the low one first (`n` `N`): it wraps at
+  65535 otherwise, which a long run will do.
+- `CRC_STATS` (0): `c` and `b`, the bridge's own CRC and count of the bytes
+  read from USB, to compare with what the host sent, at 94 bytes of flash and
+  4 of RAM. They answered one question -- whether USB itself was corrupting
+  anything, which it was not -- so they are off.
 - `RTS_OUTPUT` (0): PB2 as an RTS output (see
   [Flow control](#flow-control)), 20 bytes of flash. Harmless if you switch
   it on without wiring it: the bridge drives a pin nobody reads.
@@ -124,13 +134,17 @@ Four settings at the top of `TinyBridge.ino`:
   driving PB5, the pull-up reads "wait" and the bridge never sends a byte --
   it still receives, so the link looks half dead rather than broken.
 
-With the defaults the sketch uses 6454 of the 6650 bytes available and 309 of
-the 512 bytes of RAM; with both flow control lines, 6484; with `WIDE_STATS`,
-6474 and 313; without the counters, 5788 and 275 -- and see what that costs,
-above. (Four of those bytes are DigiCDCFast's transaction-end
-hook, which this sketch does not use; `USB_CFG_TRANSACTION_END_HOOK` in the
-library's `usbconfig.h` removes it. Measured with it either way, the bridge
-behaves identically: same throughput, no corruption, the same counters.)
+- `CALL_HOOK` (1): the largest single thing that reduces corruption here (see
+  [When the driver makes the edges](#when-the-driver-makes-the-edges)), and it
+  needs **no changes to DigiCDCFast at all** -- it fills in
+  `usbTransactionEnd()`, the weak hook the library has called since 1.3.0. It
+  does need `USB_PACKET_SIZE` 2, the sketch's default: the build fails
+  otherwise, because the hook assumes no transaction outlasts a bit time. 138
+  bytes of flash.
+
+With the defaults the sketch uses 6544 of the 6650 bytes available and 309 of
+the 512 bytes of RAM; with both flow control lines, 6574; without the hook,
+6406; without the counters, 6034 and 281 -- and see what that costs, above.
 
 ## How it works
 
@@ -199,7 +213,7 @@ The cost is throughput and a little latency: at 9600 bps with both
 directions saturated, each carries about 600 bytes/s instead of 860, and a
 received byte can wait up to 20 ms. One direction at a time is unaffected.
 To trade that back for speed, set `TIME_SHARING` to 0 at the top of
-`TinyBridge.ino` (330 bytes less flash), and the bridge behaves as it did
+`TinyBridge.ino` (284 bytes less flash), and the bridge behaves as it did
 before: a few corrupted bytes per 10 kB transmitted while receiving, on some
 hosts (see below).
 
@@ -237,13 +251,27 @@ run can corrupt hundreds of bytes, and no counter the bridge keeps says
 anything is wrong. That is what a PPP link over this bridge runs into: TCP
 retransmits the frames, so it works, but it is not free.
 
+**With the driver making the edges** (see
+[When the driver makes the edges](#when-the-driver-makes-the-edges)) the same
+test gives 2.6 per 100 kB -- but the distribution is what changed. Over 20
+runs with a reboot before each, fourteen were perfectly clean and the other
+six corrupted **exactly one byte**, where before a single run could corrupt
+eleven. Receiving stayed perfect: 0 in 492 kB.
+
+Over a real PPP link carrying two 400 kB file transfers at once, with both
+hooks on: **1.12 MB received without a single error**, and 41 damaged frames
+in 7281 sent, which is 0.56% of frames or about 4.3 corrupted bytes per
+100 kB. Before the hooks the same test damaged about 34 frames per 100 kB.
+
 Anyone measuring this should know that one run tells you nothing. The same
 firmware gave 6.0 and 446.7 corrupted per 100 kB in two consecutive sets of
 20 runs. Comparing two configurations means interleaving them run by run in
 one binary (`AB_TEST` in the sketch does this for the hold thresholds): done
 that way, holding at 8 bytes / 8 ms measured 4.3 per 100 kB against 0.8 for
 the 20/20 the sketch ships with, over 40 runs each -- the opposite of what the
-same comparison said when the two were measured one after the other.
+same comparison said when the two were measured one after the other. Part of
+the reason is that the board boots into one of two regimes and stays there;
+see [Two regimes](#two-regimes).
 | 19200 (10 kB) | 0, 1921 B/s | 15, 1293 B/s | receive 846 lost, 1271 corrupted; transmit 35 | receive 465 lost, 489 corrupted; transmit 221 |
 
 Below 9600 bps time sharing does nothing: the bits are long enough that USB
@@ -409,6 +437,91 @@ Things tried along the way:
   Late runs measure what actually matters, whatever causes it, at almost no
   cost per edge.
 
+## When the driver makes the edges
+
+A bit edge is a compare match on OC1A, so the hardware places it on time
+whatever the processor is doing. What the handler must do is load the *next*
+one, and it has one bit time to do it -- 104 µs at 9600 bps. V-USB keeps
+interrupts off for a whole transaction, and for a whole run of back-to-back
+transactions: up to about 200 µs. Planning each byte around the transactions
+(below) helps, but nothing the sketch does can help an edge that came due
+*during* a blackout, because the sketch is not running. Only the driver is.
+
+So the driver makes those edges. DigiCDCFast calls `usbTransactionEnd()` at
+the end of every transaction -- a weak, do-nothing function since 1.3.0 -- and
+the sketch fills it in with about sixty instructions of assembler
+(`CALL_HOOK`). Nothing in the library changes. At the end of every transaction
+it shifts the sketch's frame along, puts the
+next bit on the compare output and moves the compare one bit further --
+repeatedly, for as long as the transactions keep coming, so a blackout of any
+length up to the end of a byte is covered. It stops before the edge that ends
+a byte, which wants planning, and counts what it did so the handler can catch
+up.
+
+The handler does not recompute where the driver got to: it reads `OCR1A`, the
+driver's own latest edge, and adjusts the high byte for the single wrap that
+is possible. Only one of them ever does the arithmetic, so the two clocks
+cannot disagree. The fraction of a bit time is shared for the same reason,
+in 256ths of a tick -- a tick is 64 CPU cycles, so the conversion is exact,
+and the driver carries it with a single `adc`. An earlier version added whole
+ticks only and drifted about a tick every four bits, after which the
+handler's next edge read as displaced by all of it at once.
+
+The same hook does the receiver the same favour first, because its deadline is
+tighter: it takes USI's window of 8 samples into a stash and re-arms `USISR`.
+Re-arming clears `USIOIF`, so the sketch's own overflow interrupt does not run
+for that window at all -- which is most of what it is worth, since that
+interrupt is also what delays the transmitter.
+
+The rules for that function are DigiCDCFast's, and they are strict: naked
+assembler, and only the registers the driver saved. See *Borrowing the
+interrupt* in [DigiCDCFast's README](https://github.com/marcocarnut/DigiCDCFast).
+An earlier version of this work inlined the same instructions into the driver
+instead, on the assumption that the seven cycles of `rcall` and `ret` were
+unaffordable. They are not: the inlined form has to sit at the end of the
+driver's assembler file and jump there and back, which costs eight. Measured
+against each other the two are indistinguishable -- forced edges 12014 against
+12061 per run -- so the call wins on the only ground that separates them,
+which is that it leaves the library alone.
+
+Measured per 8 kB in both directions at once, edges the handler had to force:
+
+| | transmitting only | both directions |
+|---|---|---|
+| no hook | ~4950 | -- |
+| edge hook, one stashed edge | ~1340 | ~5000 |
+| the rest of the byte, fraction carried | 553 | 4257 |
+
+## Two regimes
+
+The same firmware sometimes behaves quite differently from one run to the
+next. In a good run the handler forces about 4200 edges per 8 kB of duplex
+traffic and loses one sample window; in a bad one, about 10000 and some 400
+windows. Nothing in the sketch chooses this, and it is not the build: the
+same hex, reflashed, gave one and then the other, and two hex files that
+measured twelvefold apart on this turned out to be byte-identical.
+
+It often persists for a whole session, which is what first suggested that the
+host's frame schedule sets it -- whether this device's two transactions land
+back to back, one blackout of 200 µs rather than two of 110. But it has also
+flipped between consecutive runs with no re-enumeration at all, which that
+explanation does not allow. The other candidate is the sketch's own planner
+latching a good or a bad estimate when a run starts: `probeBits` and the
+activity estimate are reset in `txStart()`, and the planner learns from there.
+Unresolved, and worth resolving.
+
+It is worth knowing about because it makes measurements lie. Two consecutive
+sets of 20 runs of the same firmware measured 6.0 and 446.7 corrupted bytes
+per 100 kB. **Compare configurations interleaved in one binary, switched at
+run time, never in blocks** -- `frame_test.py --modes` does this -- and read
+`g` and `e` to see which regime a run was in.
+
+With the edges made from the transaction hook the difference mostly goes away:
+across 20 runs each preceded by a reboot, forced edges stayed within 1.3% of
+each other and no run corrupted more than a single byte. It has not gone
+entirely -- the twelvefold pair above was measured after that -- so read `g`
+and `e` before trusting any run.
+
 ## The sketches
 
 - `TinyBridge/`: the bridge described above.
@@ -430,12 +543,18 @@ and clear them:
   `z` bytes sent without a safe place (see
   [When a byte fits nowhere](#when-a-byte-fits-nowhere)), `r` received bytes
   dropped for want of room, `w` times transmitting was held for data going
-  to the host, `v` edges more than a quarter of a bit late and `L` the worst
-  of them in Timer1 ticks, `P` the USB frame length it measures, in 1/16
-  Timer1 ticks (4125 with an exact 16.5 MHz clock; 0.1% is about 4),
-  `c` and `b` the CRC-16 (XMODEM) and count of the bytes read from USB, to
-  compare with what the host sent;
+  to the host, `H` times the handler found edges the driver had made for it,
+  `P` the USB frame length it measures, in 1/16 Timer1 ticks
+  (4125 with an exact 16.5 MHz clock; 0.1% is about 4), and with `CRC_STATS`
+  on, `c` and `b`, the CRC-16 (XMODEM) and count of the bytes read from USB,
+  to compare with what the host sent;
 - TinyBridgeUsi3x also: `l` glitches, `r` receive buffer overflows.
+
+Each counter is tagged by the letter at its own position in `COUNTER_TAGS`,
+so adding one means adding a letter there too; a `static_assert` fails the
+build if the two ever drift apart. `g` and `e` are worth reading first: they
+say whether a run went well or badly, which varies from one power-up to the
+next (see [Two regimes](#two-regimes)).
 
 All of them are 16-bit and wrap silently, so `n` reads 34464 after 100000
 bytes, unless `WIDE_STATS` is set (see [Build options](#build-options)). `r`
