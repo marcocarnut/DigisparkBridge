@@ -32,11 +32,10 @@
   Each byte is planned: the handler's late runs show when the transactions
   start, and a byte starts later (or after an idle bit) when one would begin
   near an edge whose next edge changes the level, so bytes go out between the
-  host's transactions. And the driver makes the edges itself while it has the
-  processor, at the end of every transaction, through DigiCDCFast's
-  USB_CFG_EDGE_HOOK and USB_CFG_USI_HOOK (see the README): planning cannot
-  help an edge that came due during a blackout, and only the driver is running
-  then.
+  host's transactions. And the edges get made while the driver has the
+  processor, from DigiCDCFast's usbTransactionEnd(), which it calls at the end
+  of every transaction (CALL_HOOK below): planning cannot help an edge that
+  came due during a blackout, because nothing of ours is running then.
 
   Latest measurements of V-USB delaying other interrupts: up to ~200 us.
 */
@@ -58,18 +57,25 @@ const uchar digiCdcConfigDescriptor[DIGICDC_DESCRIPTOR_SIZE] PROGMEM =
 DIGICDC_BUFFERS(8, 8);
 #endif
 
-// The driver's edge hook assumes no transaction outlasts a bit time, so that
+// The hook assumes no transaction outlasts a bit time, so that
 // the compare it writes is always still in the future. That holds for 2-byte
 // data packets (a transaction is at most about 19 ticks against 27 for a bit
 // at 9600 bps) and not for 8-byte ones, where the compare would land in the
 // past and nothing would fire until the timer wrapped, about a millisecond of
 // the wrong level on the line. Fail the build rather than leave that to be
 // discovered.
-#if USB_CFG_EDGE_HOOK && USB_PACKET_SIZE > 2
-#error "USB_CFG_EDGE_HOOK needs USB_PACKET_SIZE 2: see the comment above"
+#ifndef CALL_HOOK
+#define CALL_HOOK       1    // 1: make the transmitter's bit edges, and collect
+#endif                       //    USI's samples, from inside DigiCDCFast's
+                             //    usbTransactionEnd() -- the one thing that can
+                             //    run while the USB driver holds the processor.
+                             //    Worth about five times fewer forced edges; 0
+                             //    to build without it.
+#if CALL_HOOK && USB_PACKET_SIZE > 2
+#error "CALL_HOOK needs USB_PACKET_SIZE 2: see the comment above"
 #endif
-#if USB_CFG_USI_HOOK && !USB_CFG_EDGE_HOOK
-#error "USB_CFG_USI_HOOK does nothing without USB_CFG_EDGE_HOOK"
+#if CALL_HOOK && !USB_CFG_TRANSACTION_END_HOOK
+#error "CALL_HOOK needs USB_CFG_TRANSACTION_END_HOOK in DigiCDCFast's usbconfig.h"
 #endif
 
 #ifndef STATS
@@ -175,17 +181,22 @@ static volatile uint8_t txTail;        // written by the handler
 // so the driver can never be moving the compare at the same time, and the
 // driver clears it itself at the end of a byte, which wants planning.
 extern "C" {
-  uint16_t usbEdgeFrame;
-  uint8_t usbEdgeTccr, usbEdgeBit, usbEdgeBitFrac, usbEdgeFrac, usbEdgeSteps;
+  // used: nothing in C reads some of these -- only the driver's assembler, or
+  // this sketch's own, does -- and the linker discards what it cannot see read
+  uint16_t usbEdgeFrame __attribute__((used));
+  uint8_t usbEdgeTccr __attribute__((used)), usbEdgeBit __attribute__((used)),
+          usbEdgeBitFrac __attribute__((used)), usbEdgeFrac __attribute__((used)),
+          usbEdgeSteps __attribute__((used));
 }
 #define txFrame usbEdgeFrame
 #define txEdgeFrac usbEdgeFrac
-// The driver's USI hook leaves a window of samples here (USB_CFG_USI_HOOK):
+// The hook leaves a window of USI's samples here:
 // it takes one only when USI_STASH is clear, and sets it; rxCapture() empties
 // the stash and clears the bit again. Taking a window also clears USIOIF, so
 // the overflow interrupt does not run for it at all -- which is most of what
 // the hook is worth, since that interrupt is what delays the transmitter.
-extern "C" { uint8_t usbUsiSamples, usbUsiCount; }
+extern "C" { uint8_t usbUsiSamples __attribute__((used)),
+                     usbUsiCount __attribute__((used)); }
 
 #define txFlags    GPIOR0
 #define TX_ACTIVE  _BV(0)  // an edge is scheduled
@@ -323,6 +334,94 @@ static_assert(sizeof COUNTER_TAGS - 1 == sizeof stats.word / sizeof stats.word[0
               "COUNTER_TAGS needs one letter per counter word");
 #else
 #define COUNT(counter) ((void)0)
+#endif
+
+// Both time-critical jobs, done in the weak hook DigiCDCFast has called since
+// 1.3.0, so the library needs no changes at all. The alternative -- inlining
+// the same instructions into the driver -- was tried and measured
+// indistinguishable: it has to sit past the driver's cycle-counted branches
+// and jump there and back, 8 cycles against the 7 of rcall and ret.
+#if CALL_HOOK
+extern "C" void usbTransactionEnd() __attribute__((naked, used));
+void usbTransactionEnd()
+{
+  asm volatile(
+      // USI first: it has the tighter deadline, and samples missed are gone
+      "in    r16, %[usisr]        \n"
+      "sbrs  r16, %[usioif]       \n"   // no window waiting
+      "rjmp  1f                   \n"
+      "sbic  %[gpior], 7          \n"   // the stash still holds the last one
+      "rjmp  1f                   \n"
+      "in    r17, %[tcnt0]        \n"   // keep clear of the compare match,
+      "tst   r17                  \n"   // where a sample shifts in
+      "breq  1f                   \n"
+      "in    r20, %[ocr0a]        \n"
+      "sub   r20, r17             \n"
+      "cpi   r20, 3               \n"
+      "brlo  1f                   \n"
+      "in    r17, %[usibr]        \n"
+      "sts   usbUsiSamples, r17   \n"
+      "andi  r16, 0x0F            \n"
+      "sts   usbUsiCount, r16     \n"
+      "subi  r16, -8              \n"   // next overflow 8 samples on
+      "andi  r16, 0x0F            \n"
+      "ori   r16, %[usioifm]      \n"
+      "out   %[usisr], r16        \n"
+      "sbi   %[gpior], 7          \n"
+      "1:                         \n"
+      // then the next bit edge, and the rest of the byte if they keep coming
+      "sbis  %[gpior], 6          \n"
+      "ret                        \n"
+      "in    r16, %[tifr]         \n"
+      "sbrs  r16, %[ocf1a]        \n"   // the timer's own edge has not happened
+      "ret                        \n"
+      "lds   r16, usbEdgeFrame    \n"
+      "lds   r17, usbEdgeFrame+1  \n"
+      "cpi   r16, 4               \n"   // stop before the edge ending the byte
+      "brsh  2f                   \n"
+      "tst   r17                  \n"
+      "brne  2f                   \n"
+      "cbi   %[gpior], 6          \n"
+      "ret                        \n"
+      "2:                         \n"
+      "lsr   r17                  \n"
+      "ror   r16                  \n"
+      "sts   usbEdgeFrame, r16    \n"
+      "sts   usbEdgeFrame+1, r17  \n"
+      "lds   r17, usbEdgeTccr     \n"
+      "ori   r17, %[edgeclr]      \n"
+      "sbrc  r16, 0               \n"
+      "ori   r17, %[edgeset]      \n"
+      "out   %[tccr1], r17        \n"
+      "lds   r16, usbEdgeFrac     \n"   // carry the fraction of a bit time:
+      "lds   r17, usbEdgeBitFrac  \n"   // sts, in and lds leave the carry
+      "add   r16, r17             \n"   // alone, so it reaches the adc below
+      "sts   usbEdgeFrac, r16     \n"
+      "in    r17, %[ocr1a]        \n"
+      "lds   r16, usbEdgeBit      \n"
+      "adc   r17, r16             \n"
+      "out   %[ocr1a], r17        \n"
+      "ldi   r16, %[ocf1am]       \n"
+      "out   %[tifr], r16         \n"   // the handler is wanted at that edge
+      "lds   r16, usbEdgeSteps    \n"   // which it counts, to catch its clock up
+      "inc   r16                  \n"
+      "sts   usbEdgeSteps, r16    \n"
+      "ret                        \n"
+      :: [usisr]   "I"(_SFR_IO_ADDR(USISR)),
+         [usibr]   "I"(_SFR_IO_ADDR(USIBR)),
+         [gpior]   "I"(_SFR_IO_ADDR(GPIOR0)),
+         [tcnt0]   "I"(_SFR_IO_ADDR(TCNT0)),
+         [ocr0a]   "I"(_SFR_IO_ADDR(OCR0A)),
+         [tifr]    "I"(_SFR_IO_ADDR(TIFR)),
+         [tccr1]   "I"(_SFR_IO_ADDR(TCCR1)),
+         [ocr1a]   "I"(_SFR_IO_ADDR(OCR1A)),
+         [usioif]  "I"(USIOIF),
+         [usioifm] "M"(_BV(USIOIF)),
+         [ocf1a]   "I"(OCF1A),
+         [ocf1am]  "M"(_BV(OCF1A)),
+         [edgeclr] "M"(COM1A_CLR),
+         [edgeset] "M"(COM1A_SET));
+}
 #endif
 
 // Timer1 ticks, counted on from the last call: call at least every 256 ticks

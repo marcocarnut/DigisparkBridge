@@ -1,8 +1,8 @@
 # DigisparkBridge
 
 A minimalistic (8N1 only, RTS flow control) USB-to-UART bridge for the
-original Digispark (ATtiny85) and limited to 9,600 bps full duplex
-(both directions at once) by taking turns around USB traffic
+original Digispark (ATtiny85) and limited to 9,600 bps "quasi-full duplex"
+(both directions at once, almost) by taking turns around USB traffic
 (see notes below); receiving alone works up to 19,200 bps.
 Which is not too shabby for a device that has no UART
 at all: it receives with the USI peripheral, oversampling in hardware, and
@@ -10,18 +10,25 @@ transmits with bit edges timed by a timer's compare output,
 while [DigiCDCFast](https://github.com/marcocarnut/DigiCDCFast) runs
 bitbanged USB in software on the same 8-bit chip.
 
-**Is it useful?** At 1200 to 9600 bps, yes: every test passes, in either
-direction and both at once, with no lost or corrupted bytes. The price is
-throughput when both directions are busy at 9600 bps: the bridge and the
-host take turns on USB, so each way carries about 600 bytes/s instead of
-860, and received bytes can wait up to 20 ms. That is
-[time sharing](#time-sharing-both-directions-at-once), which can be turned
-off for full speed at the cost of the occasional corrupted byte
-(`TIME_SHARING` in the sketch). Above 9600 bps only receiving works.
+**Is it useful?** At 1200 to 4800 bps, yes: every test passes, in either
+direction and both at once, with no lost or corrupted bytes. At 9600 bps it
+works almost perfectly -- either direction alone is clean, and only with both
+near saturation does it corrupt a few bytes per 100 kB on the way out. The
+other price is throughput: the bridge and the host take turns on USB, so each
+direction carries about 600 bytes/s instead of 860 transmitting and 960
+receiving, and received bytes can wait up to 20 ms. That is
+[time sharing](#time-sharing-both-directions-at-once), which can be switched
+off for full speed at the cost of more corruption (`TIME_SHARING` in the
+sketch). That's why "quasi full duplex". It's pretty usable, but not perfect.
+Above 9600 bps only receiving works.
 
-For a serial port at any rate, a USB-serial chip costs less than a dollar,
+For a 9600 serial GPS, for instance, those imperfections are inconsequential;
+so, yes, it is useful -- if anything, to give those aging Digisparks a better
+meaning to their lives than sitting unused in your drawer.
+
+For a true serial port at any rate, a USB-serial chip costs less than a dollar,
 and the [DigisparkProBridge](https://github.com/marcocarnut/DigisparkProBridge)
-has a hardware UART and is lossless to 38400 bps in both directions.
+has a hardware UART and is lossless to 57600 bps in both directions.
 
 It is also a demonstration of what a fast USB serial library like
 [DigiCDCFast](https://github.com/marcocarnut/DigiCDCFast) makes
@@ -127,25 +134,17 @@ Settings at the top of `TinyBridge.ino`, and two in DigiCDCFast:
   driving PB5, the pull-up reads "wait" and the bridge never sends a byte --
   it still receives, so the link looks half dead rather than broken.
 
-And two in DigiCDCFast's `src/usbconfig.h`, which have to be set there
-because the Arduino IDE compiles a library once, without the sketch's
-definitions:
+- `CALL_HOOK` (1): the largest single thing that reduces corruption here (see
+  [When the driver makes the edges](#when-the-driver-makes-the-edges)), and it
+  needs **no changes to DigiCDCFast at all** -- it fills in
+  `usbTransactionEnd()`, the weak hook the library has called since 1.3.0. It
+  does need `USB_PACKET_SIZE` 2, the sketch's default: the build fails
+  otherwise, because the hook assumes no transaction outlasts a bit time. 138
+  bytes of flash.
 
-- `USB_CFG_EDGE_HOOK` (0): **set this to 1.** The driver then makes the
-  bridge's bit edges itself while it holds the processor, which is the single
-  largest thing that reduces corruption here (see
-  [When the driver makes the edges](#when-the-driver-makes-the-edges)). It
-  needs `USB_PACKET_SIZE` 2, the sketch's default: the build fails otherwise,
-  because the hook assumes no transaction outlasts a bit time.
-- `USB_CFG_USI_HOOK` (0): set this to 1 as well. The driver also collects
-  USI's samples at the end of each transaction, which mostly helps by
-  stopping the receive interrupt from firing for every window.
-
-With the hooks on the sketch uses 6548 of the 6650 bytes available and 309 of
-the 512 bytes of RAM; with both flow control lines, 6578; with the hooks off,
-6390 and 304; without the counters, 5880 and 276 -- and see what that costs,
-above. The hooks cost nothing when they are off: the sketch builds to exactly
-the size it did before they existed.
+With the defaults the sketch uses 6544 of the 6650 bytes available and 309 of
+the 512 bytes of RAM; with both flow control lines, 6574; without the hook,
+6406; without the counters, 6034 and 281 -- and see what that costs, above.
 
 ## How it works
 
@@ -448,8 +447,11 @@ transactions: up to about 200 µs. Planning each byte around the transactions
 (below) helps, but nothing the sketch does can help an edge that came due
 *during* a blackout, because the sketch is not running. Only the driver is.
 
-So the driver makes those edges, through DigiCDCFast's `USB_CFG_EDGE_HOOK`.
-At the end of every transaction it shifts the sketch's frame along, puts the
+So the driver makes those edges. DigiCDCFast calls `usbTransactionEnd()` at
+the end of every transaction -- a weak, do-nothing function since 1.3.0 -- and
+the sketch fills it in with about sixty instructions of assembler
+(`CALL_HOOK`). Nothing in the library changes. At the end of every transaction
+it shifts the sketch's frame along, puts the
 next bit on the compare output and moves the compare one bit further --
 repeatedly, for as long as the transactions keep coming, so a blackout of any
 length up to the end of a byte is covered. It stops before the edge that ends
@@ -465,11 +467,22 @@ and the driver carries it with a single `adc`. An earlier version added whole
 ticks only and drifted about a tick every four bits, after which the
 handler's next edge read as displaced by all of it at once.
 
-`USB_CFG_USI_HOOK` does the same favour for the receiver: it takes USI's
-window of 8 samples into a stash and re-arms `USISR`. Re-arming clears
-`USIOIF`, so the sketch's own overflow interrupt does not run for that window
-at all -- which is most of what it is worth, since that interrupt is also
-what delays the transmitter.
+The same hook does the receiver the same favour first, because its deadline is
+tighter: it takes USI's window of 8 samples into a stash and re-arms `USISR`.
+Re-arming clears `USIOIF`, so the sketch's own overflow interrupt does not run
+for that window at all -- which is most of what it is worth, since that
+interrupt is also what delays the transmitter.
+
+The rules for that function are DigiCDCFast's, and they are strict: naked
+assembler, and only the registers the driver saved. See *Borrowing the
+interrupt* in [DigiCDCFast's README](https://github.com/marcocarnut/DigiCDCFast).
+An earlier version of this work inlined the same instructions into the driver
+instead, on the assumption that the seven cycles of `rcall` and `ret` were
+unaffordable. They are not: the inlined form has to sit at the end of the
+driver's assembler file and jump there and back, which costs eight. Measured
+against each other the two are indistinguishable -- forced edges 12014 against
+12061 per run -- so the call wins on the only ground that separates them,
+which is that it leaves the library alone.
 
 Measured per 8 kB in both directions at once, edges the handler had to force:
 
