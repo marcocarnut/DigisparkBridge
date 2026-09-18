@@ -494,14 +494,21 @@ Measured per 8 kB in both directions at once, edges the handler had to force:
 
 ## Two regimes
 
-The same firmware behaves differently from one power-up to the next, and
-keeps whichever way it lands for the whole session. In a good one the handler
-forces about 5000 edges per 8 kB of duplex traffic and loses one sample
-window; in a bad one, about 14600 and some 300 windows. Nothing in the sketch
-chooses this: the same binary, reflashed, gave one and then the other. The
-likeliest cause is where the host puts this device in its frame schedule, and
-so whether its two transactions land back to back -- one blackout of 200 µs
-rather than two of 110.
+The same firmware sometimes behaves quite differently from one run to the
+next. In a good run the handler forces about 4200 edges per 8 kB of duplex
+traffic and loses one sample window; in a bad one, about 10000 and some 400
+windows. Nothing in the sketch chooses this, and it is not the build: the
+same hex, reflashed, gave one and then the other, and two hex files that
+measured twelvefold apart on this turned out to be byte-identical.
+
+It often persists for a whole session, which is what first suggested that the
+host's frame schedule sets it -- whether this device's two transactions land
+back to back, one blackout of 200 µs rather than two of 110. But it has also
+flipped between consecutive runs with no re-enumeration at all, which that
+explanation does not allow. The other candidate is the sketch's own planner
+latching a good or a bad estimate when a run starts: `probeBits` and the
+activity estimate are reset in `txStart()`, and the planner learns from there.
+Unresolved, and worth resolving.
 
 It is worth knowing about because it makes measurements lie. Two consecutive
 sets of 20 runs of the same firmware measured 6.0 and 446.7 corrupted bytes
@@ -509,9 +516,11 @@ per 100 kB. **Compare configurations interleaved in one binary, switched at
 run time, never in blocks** -- `frame_test.py --modes` does this -- and read
 `g` and `e` to see which regime a run was in.
 
-With the driver making the edges, the difference largely goes away: across 20
-runs each preceded by a reboot, forced edges stayed within 1.3% and no run
-corrupted more than a single byte.
+With the edges made from the transaction hook the difference mostly goes away:
+across 20 runs each preceded by a reboot, forced edges stayed within 1.3% of
+each other and no run corrupted more than a single byte. It has not gone
+entirely -- the twelvefold pair above was measured after that -- so read `g`
+and `e` before trusting any run.
 
 ## The sketches
 
