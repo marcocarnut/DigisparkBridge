@@ -27,10 +27,16 @@
   point of the frame. With DigiCDCFast's usual 8-byte packets each takes
   ~110 us, longer than the deadline; built for 2-byte packets (below), ~73 us.
   A transaction starting just before an edge, or while its handler runs, can
-  still hold the handler past the next edge. So each byte is planned: the
-  handler's late runs show when the transactions start, and a byte starts
-  later (or after an idle bit) when one would begin near an edge whose next
-  edge changes the level. Bytes go out between the host's transactions.
+  still hold the handler past the next edge, and a run of back-to-back
+  transactions can hold it for the length of several. Two things answer that.
+  Each byte is planned: the handler's late runs show when the transactions
+  start, and a byte starts later (or after an idle bit) when one would begin
+  near an edge whose next edge changes the level, so bytes go out between the
+  host's transactions. And the driver makes the edges itself while it has the
+  processor, at the end of every transaction, through DigiCDCFast's
+  USB_CFG_EDGE_HOOK and USB_CFG_USI_HOOK (see the README): planning cannot
+  help an edge that came due during a blackout, and only the driver is running
+  then.
 
   Latest measurements of V-USB delaying other interrupts: up to ~200 us.
 */
@@ -51,7 +57,6 @@ const uchar digiCdcConfigDescriptor[DIGICDC_DESCRIPTOR_SIZE] PROGMEM =
     DIGICDC_CONFIG_DESCRIPTOR(USB_PACKET_SIZE, USB_PACKET_SIZE);
 DIGICDC_BUFFERS(8, 8);
 #endif
-#include <util/crc16.h>
 
 #ifndef STATS
 #define STATS           1    // 1: 110 bps prints and clears diagnostic counters.
@@ -145,17 +150,15 @@ static volatile uint8_t txTail;        // written by the handler
 // sketch has less of than it would like. GPIOR0 is in the bit-addressable I/O
 // range, so each is set or cleared in a single instruction that no interrupt
 // can land inside -- which is what the ones shared with the handlers need.
-// The edge after the one the timer holds, ready for usbTransactionEnd() to
-// load while V-USB has the processor: OCR1A reaches only one edge ahead, and a
-// run of USB transactions can outlast a bit. EDGE_READY says the stash is
-// valid; the handler clears it while it programs, so the hook cannot land in
-// the middle of that, and the hook clears it when it uses the stash.
 // The driver makes edges of its own from these while it holds the processor:
 // the rest of the byte (usbEdgeFrame, the handler's own frame), the compare
 // output bits without the level (usbEdgeTccr), a bit time in ticks and in
 // 256ths of a tick (usbEdgeBit, usbEdgeBitFrac) with the running fraction the
 // handler shares (usbEdgeFrac), and how many edges it has made since the
-// handler last looked (usbEdgeSteps).
+// handler last looked (usbEdgeSteps). EDGE_READY (below) says they are worth
+// using: the handler clears it before it looks at them and while it programs,
+// so the driver can never be moving the compare at the same time, and the
+// driver clears it itself at the end of a byte, which wants planning.
 extern "C" {
   uint16_t usbEdgeFrame;
   uint8_t usbEdgeTccr, usbEdgeBit, usbEdgeBitFrac, usbEdgeFrac, usbEdgeSteps;
@@ -163,8 +166,10 @@ extern "C" {
 #define txFrame usbEdgeFrame
 #define txEdgeFrac usbEdgeFrac
 // The driver's USI hook leaves a window of samples here (USB_CFG_USI_HOOK):
-// it takes one only when GPIOR0 bit 7 is clear, and sets it; rxCapture()
-// empties the stash and clears the bit again.
+// it takes one only when USI_STASH is clear, and sets it; rxCapture() empties
+// the stash and clears the bit again. Taking a window also clears USIOIF, so
+// the overflow interrupt does not run for it at all -- which is most of what
+// the hook is worth, since that interrupt is what delays the transmitter.
 extern "C" { uint8_t usbUsiSamples, usbUsiCount; }
 
 #define txFlags    GPIOR0
@@ -175,7 +180,7 @@ extern "C" { uint8_t usbUsiSamples, usbUsiCount; }
 #define TX_HELD    _BV(4)  // ... and it has, between bytes
 #define SHARE_USB  _BV(5)  // bits short enough for USB data to the host to corrupt them
 #define USI_STASH  _BV(7)  // usbUsiSamples/usbUsiCount hold a window the driver took
-#define EDGE_READY _BV(6)  // usbEdgeOcr/usbEdgeTccr hold the edge after the timer's
+#define EDGE_READY _BV(6)  // the driver may make the rest of the byte's edges
 // Time sharing: USB data to the host (IN packets) never goes out while a
 // byte is being transmitted. loop() asks the transmitter to hold (txHold);
 // it finishes the byte on the line and sends idle bits (txHeld) while
@@ -250,7 +255,19 @@ static uint8_t bandBefore;             // activity starting this soon before an 
 #else
 #define SPAN_TAGS ""
 #endif
-#define COUNTER_TAGS "kP" N_TAGS "gofeahpzrwH" SPAN_TAGS "c" B_TAGS
+#ifndef CRC_STATS
+#define CRC_STATS 0      // 1: c and b, the bridge's own CRC and count of the
+#endif                   //    bytes read from USB, to compare with what the
+                         //    host sent. They answered one question -- whether
+                         //    USB itself corrupts anything, which it does not
+                         //    -- and cost 90 bytes of flash to keep asking.
+#if CRC_STATS
+#include <util/crc16.h>
+#define CRC_TAGS "c" B_TAGS
+#else
+#define CRC_TAGS ""
+#endif
+#define COUNTER_TAGS "kP" N_TAGS "gofeahpzrwH" SPAN_TAGS CRC_TAGS
 #if WIDE_STATS
 #define COUNTER uint32_t
 #else
@@ -278,8 +295,10 @@ struct Counters {
   uint8_t spare2;              //    (filler)
   uint16_t badBits;            // x: and how many moved by a whole bit or more,
 #endif                         //    which must misread
+#if CRC_STATS
   uint16_t usbCrc;             // c: CRC-XMODEM of the bytes read from USB
   COUNTER usbBytes;            // b
+#endif
 };
 static union {
   struct Counters c;
@@ -937,8 +956,10 @@ void loop()
     txBuf[txHead] = SerialUSB.read();
 #if STATS
 #if !SPAN_STATS
+#if CRC_STATS
     stats.c.usbCrc = _crc_xmodem_update(stats.c.usbCrc, txBuf[txHead]);
     stats.c.usbBytes++;
+#endif
 #endif
 #endif
     txHead = next;

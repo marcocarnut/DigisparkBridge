@@ -98,21 +98,25 @@ stty -F /dev/ttyACM0 134        # only if a bridge is already running
 
 ### Build options
 
-Four settings at the top of `TinyBridge.ino`:
+Settings at the top of `TinyBridge.ino`, and two in DigiCDCFast:
 
 - `TIME_SHARING` (1): hold data going to the host while transmitting, for
   reliable full duplex at 9600 bps (see
   [Time sharing](#time-sharing-both-directions-at-once)). 0 is faster and
   corrupts a byte now and then, and saves 350 bytes of flash.
 - `STATS` (1): the diagnostic counters and the 110 bps command that prints
-  them (see [Diagnostics](#diagnostics)). They cost 726 bytes of flash and 25
+  them (see [Diagnostics](#diagnostics)). They cost 668 bytes of flash and 33
   of RAM, which this sketch can ill afford -- but turning them off is not
   free either. The transmitter's timing was tuned with them compiled in, and
   without them three runs of 50 kB in both directions corrupted two bytes,
   where the same code with them corrupted none. They stay on until the
-  planner is retuned without them. With `WIDE_STATS` (0) the
-  byte counters are 32-bit, printed as two halves (`N`/`n`, `B`/`b`), at 60
-  bytes of flash: they wrap at 65535 otherwise.
+  planner is retuned without them. With `WIDE_STATS` (0) the byte counter is
+  32-bit, printed as two words, the low one first (`n` `N`): it wraps at
+  65535 otherwise, which a long run will do.
+- `CRC_STATS` (0): `c` and `b`, the bridge's own CRC and count of the bytes
+  read from USB, to compare with what the host sent, at 94 bytes of flash and
+  4 of RAM. They answered one question -- whether USB itself was corrupting
+  anything, which it was not -- so they are off.
 - `RTS_OUTPUT` (0): PB2 as an RTS output (see
   [Flow control](#flow-control)), 20 bytes of flash. Harmless if you switch
   it on without wiring it: the bridge drives a pin nobody reads.
@@ -123,13 +127,23 @@ Four settings at the top of `TinyBridge.ino`:
   driving PB5, the pull-up reads "wait" and the bridge never sends a byte --
   it still receives, so the link looks half dead rather than broken.
 
-With the defaults the sketch uses 6488 of the 6650 bytes available and 296 of
-the 512 bytes of RAM; with both flow control lines, 6496; with `WIDE_STATS`,
-6548 and 300; without the counters, 5762 and 271 -- and see what that costs,
-above. (Four of those bytes are DigiCDCFast's transaction-end
-hook, which this sketch does not use; `USB_CFG_TRANSACTION_END_HOOK` in the
-library's `usbconfig.h` removes it. Measured with it either way, the bridge
-behaves identically: same throughput, no corruption, the same counters.)
+And two in DigiCDCFast's `src/usbconfig.h`, which have to be set there
+because the Arduino IDE compiles a library once, without the sketch's
+definitions:
+
+- `USB_CFG_EDGE_HOOK` (0): **set this to 1.** The driver then makes the
+  bridge's bit edges itself while it holds the processor, which is the single
+  largest thing that reduces corruption here (see
+  [When the driver makes the edges](#when-the-driver-makes-the-edges)).
+- `USB_CFG_USI_HOOK` (0): set this to 1 as well. The driver also collects
+  USI's samples at the end of each transaction, which mostly helps by
+  stopping the receive interrupt from firing for every window.
+
+With the hooks on the sketch uses 6548 of the 6650 bytes available and 309 of
+the 512 bytes of RAM; with both flow control lines, 6578; with the hooks off,
+6390 and 304; without the counters, 5880 and 276 -- and see what that costs,
+above. The hooks cost nothing when they are off: the sketch builds to exactly
+the size it did before they existed.
 
 ## How it works
 
@@ -236,13 +250,27 @@ run can corrupt hundreds of bytes, and no counter the bridge keeps says
 anything is wrong. That is what a PPP link over this bridge runs into: TCP
 retransmits the frames, so it works, but it is not free.
 
+**With the driver making the edges** (see
+[When the driver makes the edges](#when-the-driver-makes-the-edges)) the same
+test gives 2.6 per 100 kB -- but the distribution is what changed. Over 20
+runs with a reboot before each, fourteen were perfectly clean and the other
+six corrupted **exactly one byte**, where before a single run could corrupt
+eleven. Receiving stayed perfect: 0 in 492 kB.
+
+Over a real PPP link carrying two 400 kB file transfers at once, with both
+hooks on: **1.12 MB received without a single error**, and 41 damaged frames
+in 7281 sent, which is 0.56% of frames or about 4.3 corrupted bytes per
+100 kB. Before the hooks the same test damaged about 34 frames per 100 kB.
+
 Anyone measuring this should know that one run tells you nothing. The same
 firmware gave 6.0 and 446.7 corrupted per 100 kB in two consecutive sets of
 20 runs. Comparing two configurations means interleaving them run by run in
 one binary (`AB_TEST` in the sketch does this for the hold thresholds): done
 that way, holding at 8 bytes / 8 ms measured 4.3 per 100 kB against 0.8 for
 the 20/20 the sketch ships with, over 40 runs each -- the opposite of what the
-same comparison said when the two were measured one after the other.
+same comparison said when the two were measured one after the other. Part of
+the reason is that the board boots into one of two regimes and stays there;
+see [Two regimes](#two-regimes).
 | 19200 (10 kB) | 0, 1921 B/s | 15, 1293 B/s | receive 846 lost, 1271 corrupted; transmit 35 | receive 465 lost, 489 corrupted; transmit 221 |
 
 Below 9600 bps time sharing does nothing: the bits are long enough that USB
@@ -408,6 +436,68 @@ Things tried along the way:
   Late runs measure what actually matters, whatever causes it, at almost no
   cost per edge.
 
+## When the driver makes the edges
+
+A bit edge is a compare match on OC1A, so the hardware places it on time
+whatever the processor is doing. What the handler must do is load the *next*
+one, and it has one bit time to do it -- 104 µs at 9600 bps. V-USB keeps
+interrupts off for a whole transaction, and for a whole run of back-to-back
+transactions: up to about 200 µs. Planning each byte around the transactions
+(below) helps, but nothing the sketch does can help an edge that came due
+*during* a blackout, because the sketch is not running. Only the driver is.
+
+So the driver makes those edges, through DigiCDCFast's `USB_CFG_EDGE_HOOK`.
+At the end of every transaction it shifts the sketch's frame along, puts the
+next bit on the compare output and moves the compare one bit further --
+repeatedly, for as long as the transactions keep coming, so a blackout of any
+length up to the end of a byte is covered. It stops before the edge that ends
+a byte, which wants planning, and counts what it did so the handler can catch
+up.
+
+The handler does not recompute where the driver got to: it reads `OCR1A`, the
+driver's own latest edge, and adjusts the high byte for the single wrap that
+is possible. Only one of them ever does the arithmetic, so the two clocks
+cannot disagree. The fraction of a bit time is shared for the same reason,
+in 256ths of a tick -- a tick is 64 CPU cycles, so the conversion is exact,
+and the driver carries it with a single `adc`. An earlier version added whole
+ticks only and drifted about a tick every four bits, after which the
+handler's next edge read as displaced by all of it at once.
+
+`USB_CFG_USI_HOOK` does the same favour for the receiver: it takes USI's
+window of 8 samples into a stash and re-arms `USISR`. Re-arming clears
+`USIOIF`, so the sketch's own overflow interrupt does not run for that window
+at all -- which is most of what it is worth, since that interrupt is also
+what delays the transmitter.
+
+Measured per 8 kB in both directions at once, edges the handler had to force:
+
+| | transmitting only | both directions |
+|---|---|---|
+| no hook | ~4950 | -- |
+| edge hook, one stashed edge | ~1340 | ~5000 |
+| the rest of the byte, fraction carried | 553 | 4257 |
+
+## Two regimes
+
+The same firmware behaves differently from one power-up to the next, and
+keeps whichever way it lands for the whole session. In a good one the handler
+forces about 5000 edges per 8 kB of duplex traffic and loses one sample
+window; in a bad one, about 14600 and some 300 windows. Nothing in the sketch
+chooses this: the same binary, reflashed, gave one and then the other. The
+likeliest cause is where the host puts this device in its frame schedule, and
+so whether its two transactions land back to back -- one blackout of 200 µs
+rather than two of 110.
+
+It is worth knowing about because it makes measurements lie. Two consecutive
+sets of 20 runs of the same firmware measured 6.0 and 446.7 corrupted bytes
+per 100 kB. **Compare configurations interleaved in one binary, switched at
+run time, never in blocks** -- `frame_test.py --modes` does this -- and read
+`g` and `e` to see which regime a run was in.
+
+With the driver making the edges, the difference largely goes away: across 20
+runs each preceded by a reboot, forced edges stayed within 1.3% and no run
+corrupted more than a single byte.
+
 ## The sketches
 
 - `TinyBridge/`: the bridge described above.
@@ -429,11 +519,18 @@ and clear them:
   `z` bytes sent without a safe place (see
   [When a byte fits nowhere](#when-a-byte-fits-nowhere)), `r` received bytes
   dropped for want of room, `w` times transmitting was held for data going
-  to the host, `P` the USB frame length it measures, in 1/16 Timer1 ticks
-  (4125 with an exact 16.5 MHz clock; 0.1% is about 4),
-  `c` and `b` the CRC-16 (XMODEM) and count of the bytes read from USB, to
-  compare with what the host sent;
+  to the host, `H` times the handler found edges the driver had made for it,
+  `P` the USB frame length it measures, in 1/16 Timer1 ticks
+  (4125 with an exact 16.5 MHz clock; 0.1% is about 4), and with `CRC_STATS`
+  on, `c` and `b`, the CRC-16 (XMODEM) and count of the bytes read from USB,
+  to compare with what the host sent;
 - TinyBridgeUsi3x also: `l` glitches, `r` receive buffer overflows.
+
+Each counter is tagged by the letter at its own position in `COUNTER_TAGS`,
+so adding one means adding a letter there too; a `static_assert` fails the
+build if the two ever drift apart. `g` and `e` are worth reading first: they
+say whether a run went well or badly, which varies from one power-up to the
+next (see [Two regimes](#two-regimes)).
 
 All of them are 16-bit and wrap silently, so `n` reads 34464 after 100000
 bytes, unless `WIDE_STATS` is set (see [Build options](#build-options)). `r`
