@@ -103,16 +103,17 @@ Four settings at the top of `TinyBridge.ino`:
 - `TIME_SHARING` (1): hold data going to the host while transmitting, for
   reliable full duplex at 9600 bps (see
   [Time sharing](#time-sharing-both-directions-at-once)). 0 is faster and
-  corrupts a byte now and then, and saves 350 bytes of flash.
+  corrupts a byte now and then, and saves 286 bytes of flash.
 - `STATS` (1): the diagnostic counters and the 110 bps command that prints
-  them (see [Diagnostics](#diagnostics)). They cost 726 bytes of flash and 25
+  them (see [Diagnostics](#diagnostics)). They cost 666 bytes of flash and 34
   of RAM, which this sketch can ill afford -- but turning them off is not
   free either. The transmitter's timing was tuned with them compiled in, and
   without them three runs of 50 kB in both directions corrupted two bytes,
   where the same code with them corrupted none. They stay on until the
   planner is retuned without them. With `WIDE_STATS` (0) the
-  byte counters are 32-bit, printed as two halves (`N`/`n`, `B`/`b`), at 60
-  bytes of flash: they wrap at 65535 otherwise.
+  byte counters are 32-bit, printed as two words each, the low one first
+  (`n` `N`, `b` `B`), at 20 bytes of flash and 4 of RAM: they wrap at 65535
+  otherwise.
 - `RTS_OUTPUT` (0): PB2 as an RTS output (see
   [Flow control](#flow-control)), 20 bytes of flash. Harmless if you switch
   it on without wiring it: the bridge drives a pin nobody reads.
@@ -123,9 +124,9 @@ Four settings at the top of `TinyBridge.ino`:
   driving PB5, the pull-up reads "wait" and the bridge never sends a byte --
   it still receives, so the link looks half dead rather than broken.
 
-With the defaults the sketch uses 6488 of the 6650 bytes available and 296 of
-the 512 bytes of RAM; with both flow control lines, 6496; with `WIDE_STATS`,
-6548 and 300; without the counters, 5762 and 271 -- and see what that costs,
+With the defaults the sketch uses 6454 of the 6650 bytes available and 309 of
+the 512 bytes of RAM; with both flow control lines, 6484; with `WIDE_STATS`,
+6474 and 313; without the counters, 5788 and 275 -- and see what that costs,
 above. (Four of those bytes are DigiCDCFast's transaction-end
 hook, which this sketch does not use; `USB_CFG_TRANSACTION_END_HOOK` in the
 library's `usbconfig.h` removes it. Measured with it either way, the bridge
@@ -429,8 +430,9 @@ and clear them:
   `z` bytes sent without a safe place (see
   [When a byte fits nowhere](#when-a-byte-fits-nowhere)), `r` received bytes
   dropped for want of room, `w` times transmitting was held for data going
-  to the host, `P` the USB frame length it measures, in 1/16 Timer1 ticks
-  (4125 with an exact 16.5 MHz clock; 0.1% is about 4),
+  to the host, `v` edges more than a quarter of a bit late and `L` the worst
+  of them in Timer1 ticks, `P` the USB frame length it measures, in 1/16
+  Timer1 ticks (4125 with an exact 16.5 MHz clock; 0.1% is about 4),
   `c` and `b` the CRC-16 (XMODEM) and count of the bytes read from USB, to
   compare with what the host sent;
 - TinyBridgeUsi3x also: `l` glitches, `r` receive buffer overflows.

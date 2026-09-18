@@ -190,28 +190,50 @@ static uint8_t bandBefore;             // activity starting this soon before an 
 #define COM1A_CLR  _BV(COM1A1)
 
 
-// Diagnostic counters, printed at STATS_BAUD
+// Diagnostic counters, printed at STATS_BAUD as one hex word each. The printer
+// walks the array half of the union rather than naming the counters one by one
+// -- much less code -- so each one is tagged by the letter at its own place in
+// COUNTER_TAGS. Keep the two in step when adding a counter.
 #if STATS
 #ifndef WIDE_STATS
-#define WIDE_STATS 0     // 1: the byte counters (n, b) are 32-bit, printed as two halves
+#define WIDE_STATS 0     // 1: the byte counters (n, b) are 32-bit, printed as
+                         //    two words, the low one first (n N and b B)
 #endif
 #if WIDE_STATS
 #define COUNTER uint32_t
+#define COUNTER_TAGS "kPnNgofeahpzrwvLcbB"
 #else
 #define COUNTER uint16_t
+#define COUNTER_TAGS "kPngofeahpzrwvLcb"
 #endif
-#define COUNT(counter) (stats.counter++)
-static struct {
-  COUNTER received;                             // bytes: 16 bits wrap in a long test
-  uint16_t gaps, framingErrors;
-  uint16_t forcedEdges, seen, shifted, probed, gaveUp;  // updated by the transmitter
-  uint16_t rxOverflows, holds;
-  uint16_t veryLate;                            // edges late by more than a quarter bit
-  uint8_t worstLate;                            // and the worst of them, in ticks
-  uint8_t captureOverflows;                     // updated by the receive handler
-  uint16_t usbCrc;                              // CRC-XMODEM of the bytes read from USB
-  COUNTER usbBytes;
+#define COUNT(counter) (stats.c.counter++)
+struct Counters {
+  uint16_t unused;             // k: stack bytes never touched
+  uint16_t period;             // P: framePeriod, a copy
+  COUNTER received;            // n: bytes: 16 bits wrap in a long test
+  uint16_t gaps;               // g
+  uint8_t captureOverflows;    // o: updated by the receive handler
+  uint8_t spare1;              //    (the filler that keeps the slots words)
+  uint16_t framingErrors;      // f
+  uint16_t forcedEdges;        // e: this one and the next four, by the transmitter
+  uint16_t seen;               // a
+  uint16_t shifted;            // h
+  uint16_t probed;             // p
+  uint16_t gaveUp;             // z
+  uint16_t rxOverflows;        // r
+  uint16_t holds;              // w
+  uint16_t veryLate;           // v: edges late by more than a quarter bit
+  uint8_t worstLate;           // L: and the worst of them, in ticks
+  uint8_t spare2;              //    (filler)
+  uint16_t usbCrc;             // c: CRC-XMODEM of the bytes read from USB
+  COUNTER usbBytes;            // b
+};
+static union {
+  struct Counters c;
+  uint16_t word[sizeof(struct Counters) / sizeof(uint16_t)];
 } stats;
+static_assert(sizeof COUNTER_TAGS - 1 == sizeof stats.word / sizeof stats.word[0],
+              "COUNTER_TAGS needs one letter per counter word");
 #else
 #define COUNT(counter) ((void)0)
 #endif
@@ -464,8 +486,8 @@ extern "C" __attribute__((used)) uint8_t txSchedule(uint8_t edgeMade)
     // whether the other end still reads the bit, and counting must not make
     // it later.
     if (lateBy) {
-      if (lateBy > stats.worstLate)
-        stats.worstLate = lateBy;
+      if (lateBy > stats.c.worstLate)
+        stats.c.worstLate = lateBy;
       if (lateBy > (bitTicks >> 2))
         COUNT(veryLate);
     }
@@ -613,36 +635,13 @@ static void writeHex(char tag, uint16_t v)
 
 static void printStats()
 {
-  cli();
-  uint8_t o = stats.captureOverflows;
-  sei();
-  uint16_t unused = 0;  // stack bytes never touched
+  static const char tags[] PROGMEM = COUNTER_TAGS;
   for (uint8_t *p = &_end; *p == 0xC5; p++)
-    unused++;
+    stats.c.unused++;
+  stats.c.period = framePeriod;  // USB frame in 1/16 Timer1 ticks: 4125 with an exact 16.5 MHz clock
   SerialUSB.write('S');
-  writeHex('k', unused);
-#if WIDE_STATS
-  writeHex('N', stats.received >> 16);
-#endif
-  writeHex('n', stats.received);
-  writeHex('g', stats.gaps);
-  writeHex('o', o);
-  writeHex('f', stats.framingErrors);
-  writeHex('e', stats.forcedEdges);
-  writeHex('a', stats.seen);
-  writeHex('h', stats.shifted);
-  writeHex('p', stats.probed);
-  writeHex('z', stats.gaveUp);
-  writeHex('r', stats.rxOverflows);
-  writeHex('w', stats.holds);
-  writeHex('v', stats.veryLate);
-  writeHex('L', stats.worstLate);
-  writeHex('P', framePeriod);  // USB frame in 1/16 Timer1 ticks: 4125 with an exact 16.5 MHz clock
-  writeHex('c', stats.usbCrc);
-#if WIDE_STATS
-  writeHex('B', stats.usbBytes >> 16);
-#endif
-  writeHex('b', stats.usbBytes);
+  for (uint8_t i = 0; i < sizeof stats.word / sizeof stats.word[0]; i++)
+    writeHex(pgm_read_byte(&tags[i]), stats.word[i]);
   SerialUSB.write('\r');
   SerialUSB.write('\n');
   // Printing kept loop() busy: drop the samples it couldn't decode meanwhile
@@ -823,8 +822,8 @@ void loop()
       break;
     txBuf[txHead] = SerialUSB.read();
 #if STATS
-    stats.usbCrc = _crc_xmodem_update(stats.usbCrc, txBuf[txHead]);
-    stats.usbBytes++;
+    stats.c.usbCrc = _crc_xmodem_update(stats.c.usbCrc, txBuf[txHead]);
+    stats.c.usbBytes++;
 #endif
     txHead = next;
   }
