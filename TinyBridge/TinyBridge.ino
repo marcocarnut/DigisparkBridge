@@ -150,7 +150,18 @@ static volatile uint8_t txTail;        // written by the handler
 // run of USB transactions can outlast a bit. EDGE_READY says the stash is
 // valid; the handler clears it while it programs, so the hook cannot land in
 // the middle of that, and the hook clears it when it uses the stash.
-extern "C" { uint8_t usbEdgeOcr, usbEdgeTccr; }
+// The driver makes edges of its own from these while it holds the processor:
+// the rest of the byte (usbEdgeFrame, the handler's own frame), the compare
+// output bits without the level (usbEdgeTccr), a bit time in ticks and in
+// 256ths of a tick (usbEdgeBit, usbEdgeBitFrac) with the running fraction the
+// handler shares (usbEdgeFrac), and how many edges it has made since the
+// handler last looked (usbEdgeSteps).
+extern "C" {
+  uint16_t usbEdgeFrame;
+  uint8_t usbEdgeTccr, usbEdgeBit, usbEdgeBitFrac, usbEdgeFrac, usbEdgeSteps;
+}
+#define txFrame usbEdgeFrame
+#define txEdgeFrac usbEdgeFrac
 // The driver's USI hook leaves a window of samples here (USB_CFG_USI_HOOK):
 // it takes one only when GPIOR0 bit 7 is clear, and sets it; rxCapture()
 // empties the stash and clears the bit again.
@@ -172,11 +183,9 @@ extern "C" { uint8_t usbUsiSamples, usbUsiCount; }
 
 static uint16_t txIdleBits;            // idle bits since the last byte
 #define LINGER_BITS 10000              // how long the handler keeps running after the last byte (~1 s at 9600 bps)
-static uint16_t txFrame;               // bit 0: the bit on the line, then the rest of the byte
 static uint16_t txEdge;                // when the next edge is due
-static uint8_t txEdgeFrac;             // and its 1/64 ticks
 static uint16_t bitCycles;
-static uint8_t bitTicks, bitFrac;      // bitCycles in ticks and 1/64 ticks
+static uint8_t bitTicks, bitFrac;      // bitCycles in ticks and 256ths of a tick
 static uint8_t edgeTicks[10];          // edge k of a byte, ticks after its start edge
 
 // USB activity: the host's transactions come every millisecond, and V-USB
@@ -384,9 +393,9 @@ ISR(USI_OVF_vect)
 
 static void txAdvance()  // txEdge one bit later
 {
-  txEdgeFrac += bitFrac;
-  txEdge += bitTicks + (txEdgeFrac >> 6);
-  txEdgeFrac &= 63;
+  uint16_t frac = txEdgeFrac + bitFrac;
+  txEdge += bitTicks + (frac >> 8);
+  txEdgeFrac = (uint8_t)frac;
 }
 
 // USB activity ended at `end`, having held the handler of an edge made `late`
@@ -488,17 +497,23 @@ extern "C" __attribute__((used)) uint8_t txSchedule(uint8_t edgeMade)
       activitySeen(now, late);
     txFlags &= ~TX_MOVED;
   }
-  static bool stashed;
-  if (stashed && !(txFlags & EDGE_READY)) {
-    // usbTransactionEnd() loaded the edge this call would have: catch up with
-    // it, silently, and go on to the one after. (Only ever inside a byte: a
-    // boundary needs planning, so nothing is stashed there.)
-    txFrame >>= 1;
-    txAdvance();
+  // Stop the driver making edges before looking at what it made: clearing the
+  // bit is a single cbi, so there is no window where both of us are moving the
+  // compare.
+  txFlags &= ~EDGE_READY;
+  if (usbEdgeSteps) {
+    // It shifted the frame along for each edge and left the latest in OCR1A,
+    // so take that rather than redo the arithmetic: the two clocks then agree
+    // exactly, and the shared fraction carries on where it left off. An edge
+    // is at most 28 ticks and it stops within a byte, so the low byte can have
+    // wrapped once at most.
+    uint8_t low = OCR1A, was = (uint8_t)txEdge;
+    txEdge = (txEdge & 0xFF00) | low;
+    if (low < was)
+      txEdge += 0x100;
     COUNT(hooked);
+    usbEdgeSteps = 0;
   }
-  stashed = false;
-  txFlags &= ~EDGE_READY;  // the hook must not fire while we are programming
   for (;;) {
     uint16_t frame = txFrame >> 1;  // bit 0: the bit that starts at the next edge
     txAdvance();
@@ -562,18 +577,15 @@ extern "C" __attribute__((used)) uint8_t txSchedule(uint8_t edgeMade)
     }
     TIFR = _BV(OCF1A);  // an old match would call the handler early
     sei();
-    // Stash the edge after this one, if it needs no planning -- which is to
-    // say anywhere inside a byte. The times are the scheduled ones, as the
-    // handler's own are: a forced edge does not move those that follow.
+    // Let the driver make the edges after this one, if they need no planning
+    // -- which is to say anywhere inside a byte: the edge that ends one wants
+    // planning, and the driver stops there by itself.
 #if AB_TEST
     if (hookArmed && (frame >> 1) != 1) {
 #else
     if ((frame >> 1) != 1) {
 #endif
-      uint8_t frac = txEdgeFrac + bitFrac;
-      usbEdgeOcr = (uint8_t)(txEdge + bitTicks + (frac >> 6));
-      usbEdgeTccr = (TCCR1 & ~COM1A_MASK) | ((frame >> 1) & 1 ? COM1A_SET : COM1A_CLR);
-      stashed = true;
+      usbEdgeTccr = TCCR1 & ~COM1A_MASK;
       txFlags |= EDGE_READY;
     }
 #if STATS && SPAN_STATS
@@ -645,7 +657,9 @@ static void uartBegin(const Rate *entry)  // entry: in flash
   GTCCR |= _BV(FOC1A);    // idle line
   bitCycles = r->bitCycles;
   bitTicks = bitCycles >> 6;
-  bitFrac = bitCycles & 63;
+  bitFrac = (bitCycles & 63) << 2;  // a tick is 64 cycles, so a cycle is 4/256
+  usbEdgeBit = bitTicks;            // the driver makes edges a bit apart too
+  usbEdgeBitFrac = bitFrac;
 #if TIME_SHARING
   if (bitTicks < 40)
     txFlags |= SHARE_USB;
@@ -653,9 +667,9 @@ static void uartBegin(const Rate *entry)  // entry: in flash
     txFlags &= ~SHARE_USB;
 #endif
   uint8_t ticks = 0;
-  uint16_t frac = 0;  // bitFrac * k / 64 < 9, but k * bitFrac needs 16 bits
+  uint16_t frac = 0;  // bitFrac * k / 256 < 9, but k * bitFrac needs 16 bits
   for (uint8_t k = 0; k < 10; k++, ticks += bitTicks, frac += bitFrac)
-    edgeTicks[k] = ticks + (frac >> 6);
+    edgeTicks[k] = ticks + (frac >> 8);
   bandBefore = WINDOW_TICKS + HANDLER_TICKS > bitTicks ? WINDOW_TICKS + HANDLER_TICKS - bitTicks : 0;
   USICR = 0;
   TCCR0B = 0;
