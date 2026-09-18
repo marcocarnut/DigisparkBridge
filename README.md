@@ -103,9 +103,9 @@ Settings at the top of `TinyBridge.ino`, and two in DigiCDCFast:
 - `TIME_SHARING` (1): hold data going to the host while transmitting, for
   reliable full duplex at 9600 bps (see
   [Time sharing](#time-sharing-both-directions-at-once)). 0 is faster and
-  corrupts a byte now and then, and saves 350 bytes of flash.
+  corrupts a byte now and then, and saves 284 bytes of flash.
 - `STATS` (1): the diagnostic counters and the 110 bps command that prints
-  them (see [Diagnostics](#diagnostics)). They cost 668 bytes of flash and 33
+  them (see [Diagnostics](#diagnostics)). They cost 510 bytes of flash and 28
   of RAM, which this sketch can ill afford -- but turning them off is not
   free either. The transmitter's timing was tuned with them compiled in, and
   without them three runs of 50 kB in both directions corrupted two bytes,
@@ -134,7 +134,9 @@ definitions:
 - `USB_CFG_EDGE_HOOK` (0): **set this to 1.** The driver then makes the
   bridge's bit edges itself while it holds the processor, which is the single
   largest thing that reduces corruption here (see
-  [When the driver makes the edges](#when-the-driver-makes-the-edges)).
+  [When the driver makes the edges](#when-the-driver-makes-the-edges)). It
+  needs `USB_PACKET_SIZE` 2, the sketch's default: the build fails otherwise,
+  because the hook assumes no transaction outlasts a bit time.
 - `USB_CFG_USI_HOOK` (0): set this to 1 as well. The driver also collects
   USI's samples at the end of each transaction, which mostly helps by
   stopping the receive interrupt from firing for every window.
@@ -212,7 +214,7 @@ The cost is throughput and a little latency: at 9600 bps with both
 directions saturated, each carries about 600 bytes/s instead of 860, and a
 received byte can wait up to 20 ms. One direction at a time is unaffected.
 To trade that back for speed, set `TIME_SHARING` to 0 at the top of
-`TinyBridge.ino` (330 bytes less flash), and the bridge behaves as it did
+`TinyBridge.ino` (284 bytes less flash), and the bridge behaves as it did
 before: a few corrupted bytes per 10 kB transmitted while receiving, on some
 hosts (see below).
 

@@ -58,6 +58,20 @@ const uchar digiCdcConfigDescriptor[DIGICDC_DESCRIPTOR_SIZE] PROGMEM =
 DIGICDC_BUFFERS(8, 8);
 #endif
 
+// The driver's edge hook assumes no transaction outlasts a bit time, so that
+// the compare it writes is always still in the future. That holds for 2-byte
+// data packets (a transaction is at most about 19 ticks against 27 for a bit
+// at 9600 bps) and not for 8-byte ones, where the compare would land in the
+// past and nothing would fire until the timer wrapped, about a millisecond of
+// the wrong level on the line. Fail the build rather than leave that to be
+// discovered.
+#if USB_CFG_EDGE_HOOK && USB_PACKET_SIZE > 2
+#error "USB_CFG_EDGE_HOOK needs USB_PACKET_SIZE 2: see the comment above"
+#endif
+#if USB_CFG_USI_HOOK && !USB_CFG_EDGE_HOOK
+#error "USB_CFG_USI_HOOK does nothing without USB_CFG_EDGE_HOOK"
+#endif
+
 #ifndef STATS
 #define STATS           1    // 1: 110 bps prints and clears diagnostic counters.
                              //    Not free to turn off: the transmit timing was
@@ -81,18 +95,31 @@ DIGICDC_BUFFERS(8, 8);
 #ifndef RX_HOLD_MS
 #define RX_HOLD_MS      20   // or the oldest is this old
 #endif
+#define HOLD_BYTES RX_HOLD_BYTES
+#define HOLD_MS    RX_HOLD_MS
+#else
+#define RX_SIZE         16   // powers of 2
+#endif
+
+// The shape of a byte on the line, and none of it specific to time sharing.
 #ifndef AB_TEST
 #define AB_TEST         0    // 1: 150 and 200 bps switch one stop bit and two,
 #endif                       //    so the two can be interleaved run by run
 #ifndef STOP_BITS
 #define STOP_BITS       1    // 2: a second stop bit, a tenth of the transmit
 #endif                       //    rate spent giving the far end an idle bit to
+                             //    resynchronise on (measured: no effect)
+#ifndef SPAN_STATS
+#define SPAN_STATS      0    // 1: measure how long each byte takes on the line
+#endif                       //    (D, x), in place of the CRC counters (c, b)
 #define FRAME_1STOP     0x600  // start bit, 8 data bits, stop bit, end marker
 #define FRAME_2STOP     0xE00  // ... and a second stop bit
 #define STARTS_1STOP    0x400  // the frame's value while its start bit is next
 #define STARTS_2STOP    0x800
-#if AB_TEST                  //    switched at run time, to interleave the two
-static bool hookArmed = true;  // 150 bps leaves the stash unarmed, 200 arms it
+#if AB_TEST
+static bool hookArmed = true;  // 150 bps leaves the driver unarmed, 200 arms it
+#define AB_SLOW    150
+#define AB_FAST    200
 #define FRAME_OF(b)     (FRAME_1STOP | ((b) << 1))
 #define FRAME_STARTS    STARTS_1STOP
 #elif STOP_BITS == 2
@@ -101,18 +128,6 @@ static bool hookArmed = true;  // 150 bps leaves the stash unarmed, 200 arms it
 #else
 #define FRAME_OF(b)     (FRAME_1STOP | ((b) << 1))
 #define FRAME_STARTS    STARTS_1STOP
-#endif
-#ifndef SPAN_STATS
-#define SPAN_STATS      0    // 1: measure how long each byte takes on the line
-#endif                       //    (D, x), in place of the CRC counters (c, b)
-#if AB_TEST
-#define AB_SLOW    150
-#define AB_FAST    200
-#endif
-#define HOLD_BYTES RX_HOLD_BYTES
-#define HOLD_MS    RX_HOLD_MS
-#else
-#define RX_SIZE         16   // powers of 2
 #endif
 #define TX_SIZE         16
 
