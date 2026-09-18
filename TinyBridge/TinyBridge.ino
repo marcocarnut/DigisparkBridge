@@ -151,6 +151,10 @@ static volatile uint8_t txTail;        // written by the handler
 // valid; the handler clears it while it programs, so the hook cannot land in
 // the middle of that, and the hook clears it when it uses the stash.
 extern "C" { uint8_t usbEdgeOcr, usbEdgeTccr; }
+// The driver's USI hook leaves a window of samples here (USB_CFG_USI_HOOK):
+// it takes one only when GPIOR0 bit 7 is clear, and sets it; rxCapture()
+// empties the stash and clears the bit again.
+extern "C" { uint8_t usbUsiSamples, usbUsiCount; }
 
 #define txFlags    GPIOR0
 #define TX_ACTIVE  _BV(0)  // an edge is scheduled
@@ -159,6 +163,7 @@ extern "C" { uint8_t usbEdgeOcr, usbEdgeTccr; }
 #define TX_HOLD    _BV(3)  // loop() has asked the transmitter to hold
 #define TX_HELD    _BV(4)  // ... and it has, between bytes
 #define SHARE_USB  _BV(5)  // bits short enough for USB data to the host to corrupt them
+#define USI_STASH  _BV(7)  // usbUsiSamples/usbUsiCount hold a window the driver took
 #define EDGE_READY _BV(6)  // usbEdgeOcr/usbEdgeTccr hold the edge after the timer's
 // Time sharing: USB data to the host (IN packets) never goes out while a
 // byte is being transmitted. loop() asks the transmitter to hold (txHold);
@@ -293,33 +298,55 @@ static uint16_t ticksNow()
 extern "C" void rxCapture() __attribute__((used));
 void rxCapture()
 {
-  // A sample shifting in between reading and rewriting the counter would be
-  // lost. It shifts at the compare match, when TCNT0 goes from OCR0A to 0,
-  // but USI's counter changes slightly later: with only TCNT0 == OCR0A-1
-  // avoided, about 1 byte in 5000 was lost or corrupted at 9600 bps. Keep
-  // clear of the ticks on both sides of the match.
-  cli();
-  for (uint8_t t; (t = TCNT0) == 0 || (uint8_t)(OCR0A - t) <= 1; )
-    ;
-  uint8_t count = USISR & 0x0F;  // samples since the overflow
-  USISR = _BV(USIOIF) | ((8 + count) & 0x0F);  // next overflow 8 samples after it
-  uint8_t samples = USIBR;
-  sei();
-
   static bool lost;
-  uint8_t slot = captureHead, bit = 1 << (slot & 7);
-  captured[slot] = samples;
-  if (count >= 8 || lost) {  // too late: a window is lost
-    if (slot & 8) GPIOR2 |= bit; else GPIOR1 |= bit;
-  } else {
-    if (slot & 8) GPIOR2 &= ~bit; else GPIOR1 &= ~bit;
+  // The driver's USI hook may have taken a window already, and may have taken
+  // one this handler was never woken for: taking a window clears USIOIF, so
+  // the overflow interrupt does not run for it. Empty the stash first, then
+  // the live window if there is one; the bookkeeping below is the same
+  // whichever a window came from.
+  for (;;) {
+    uint8_t count, samples;
+    // With interrupts off for the whole choice: otherwise the hook can take
+    // the live window between the test below and the read, and this would
+    // then read a window already taken -- 11 bytes corrupted in 8000 when it
+    // could.
+    cli();
+    if (txFlags & USI_STASH) {
+      samples = usbUsiSamples;    // read the stash before clearing the bit:
+      count = usbUsiCount;        // while it is set the hook leaves it alone
+      txFlags &= ~USI_STASH;      // one bit of GPIOR0, so a single cbi
+      sei();
+    } else if (!(USISR & _BV(USIOIF))) {
+      sei();
+      break;
+    } else {
+      // A sample shifting in between reading and rewriting the counter would
+      // be lost. It shifts at the compare match, when TCNT0 goes from OCR0A
+      // to 0, but USI's counter changes slightly later: with only
+      // TCNT0 == OCR0A-1 avoided, about 1 byte in 5000 was lost or corrupted
+      // at 9600 bps. Keep clear of the ticks on both sides of the match.
+      for (uint8_t t; (t = TCNT0) == 0 || (uint8_t)(OCR0A - t) <= 1; )
+        ;
+      count = USISR & 0x0F;  // samples since the overflow
+      USISR = _BV(USIOIF) | ((8 + count) & 0x0F);  // next overflow 8 samples after it
+      samples = USIBR;
+      sei();
+    }
+
+    uint8_t slot = captureHead, bit = 1 << (slot & 7);
+    captured[slot] = samples;
+    if (count >= 8 || lost) {  // too late: a window is lost
+      if (slot & 8) GPIOR2 |= bit; else GPIOR1 |= bit;
+    } else {
+      if (slot & 8) GPIOR2 &= ~bit; else GPIOR1 &= ~bit;
+    }
+    uint8_t next = (slot + 1) & (CAPTURE_SIZE - 1);
+    lost = next == captureTail;
+    if (!lost)
+      captureHead = next;
+    else
+      COUNT(captureOverflows);
   }
-  uint8_t next = (slot + 1) & (CAPTURE_SIZE - 1);
-  lost = next == captureTail;
-  if (!lost)
-    captureHead = next;
-  else
-    COUNT(captureOverflows);
 
   USICR = _BV(USICS0) | _BV(USIOIE);
 }
